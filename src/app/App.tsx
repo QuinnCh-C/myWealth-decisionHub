@@ -44,6 +44,24 @@ interface RuleFunctionDef {
   activeRelease: string; draftRelease: string|null; status: string;
   ruleIds: string[];
   weights?: Record<string, number>;
+  conditionSteps?: Array<{
+    id: string;
+    name: string;
+    condition: string;
+    trueFlowId: string;
+    trueLabel: string;
+    falseFlowId: string;
+    falseLabel: string;
+    note?: string;
+  }>;
+  flowOverrides?: Record<string, {
+    condition?: string;
+    trueFlowId?: string;
+    trueLabel?: string;
+    falseFlowId?: string;
+    falseLabel?: string;
+    note?: string;
+  }>;
 }
 
 interface TestCase {
@@ -537,6 +555,177 @@ function buildRuleQuickTestOutput(rule: Rule, inputs: Record<string, string>) {
   }
 }
 
+function buildRuleFunctionExecutionSpec(fn: RuleFunctionDef, allRules: Rule[]) {
+  const fnRules = fn.ruleIds.map(id=>allRules.find(r=>r.id===id)).filter(Boolean) as Rule[];
+  const flowOverride = (ruleId: string) => fn.flowOverrides?.[ruleId] ?? {};
+
+  if (fn.key === "PS") {
+    const exceptionRule = fnRules.find(r=>r.id==="R-NTW-001");
+    const scoringRules = fnRules.filter(r=>r.type!=="WeightedAggregation" && r.id!=="R-NTW-001");
+    const exceptionOverride = exceptionRule ? flowOverride(exceptionRule.id) : {};
+    return {
+      schemaVersion: "1.0",
+      functionKey: fn.key,
+      functionName: fn.name,
+      executionType: "PARALLEL_RULE_FLOW",
+      javaHandler: "RuleFunctionExecutionEngine.executeRuleFlow",
+      inputContract: Array.from(new Map(fnRules.flatMap(r=>r.inputs).map(f=>[f.name, {
+        name:f.name, type:f.type, required:f.required, description:f.desc,
+      }])).values()),
+      preFlowDecision: exceptionRule ? {
+        nodeId: "NODE-R-NTW-001",
+        ruleId: exceptionRule.id,
+        condition: { field:"exceptionFlags", operator:"isNotNull", displayLabel: exceptionOverride.condition ?? "exceptionFlags present or NTW treatment required" },
+        onTrue: {
+          flowId: exceptionOverride.trueFlowId ?? "EXCEPTION_TREATMENT_FLOW",
+          action: "APPLY_EXCEPTION_TREATMENT",
+          terminalWhen: "exceptionApplied=true",
+          reasonCode: "PS-NTW-EXCEPTION",
+          displayLabel: exceptionOverride.trueLabel ?? "Apply NTW/exception handling",
+        },
+        onFalse: {
+          flowId: exceptionOverride.falseFlowId ?? "PARALLEL_SCORING_FLOW",
+          nextNodeGroup: "scoringNodes",
+          displayLabel: exceptionOverride.falseLabel ?? "Continue to rating rule families",
+        },
+      } : null,
+      flows: exceptionRule ? [
+        {
+          flowId: "EXCEPTION_TREATMENT_FLOW",
+          type: "CONDITIONAL_EXCEPTION",
+          startsAt: "NODE-R-NTW-001",
+          outcome: "Apply NTW or exception treatment before final output",
+        },
+        {
+          flowId: "PARALLEL_SCORING_FLOW",
+          type: "PARALLEL_SCORING",
+          nodeGroup: "scoringNodes",
+          aggregationNodeId: "NODE-R-OVERALL-001",
+        },
+      ] : [
+        {
+          flowId: "PARALLEL_SCORING_FLOW",
+          type: "PARALLEL_SCORING",
+          nodeGroup: "scoringNodes",
+          aggregationNodeId: "NODE-R-OVERALL-001",
+        },
+      ],
+      customConditionNodes: (fn.conditionSteps ?? []).map(step=>({
+        nodeId: step.id,
+        nodeType: "CUSTOM_CONDITION",
+        name: step.name,
+        condition: { expression: step.condition },
+        onTrue: { flowId: step.trueFlowId, displayLabel: step.trueLabel },
+        onFalse: { flowId: step.falseFlowId, displayLabel: step.falseLabel },
+        makerNote: step.note ?? null,
+      })),
+      nodes: scoringRules.map(rule=>({
+        nodeId: `NODE-${rule.id}`,
+        ruleId: rule.id,
+        ruleType: rule.type,
+        execution: "PARALLEL",
+        weight: fn.weights?.[rule.id] ?? null,
+        editNote: flowOverride(rule.id).note ?? null,
+        skipWhen: rule.id==="R-TENOR-001" ? { field:"tenor", operator:"isNull" } : null,
+        outputMap: rule.outputs.map(o=>o.name),
+      })),
+      aggregation: {
+        nodeId: "NODE-R-OVERALL-001",
+        ruleId: "R-OVERALL-001",
+        strategy: "WEIGHTED_AGGREGATION",
+        skipStatuses: ["SKIPPED"],
+        rounding: "ceiling",
+        weights: Object.entries(fn.weights ?? {}).map(([ruleId, weight])=>({ ruleId, weight })),
+      },
+      terminalOutput: ["overallRating","weightedScore","activeWeight","reasonCodes"],
+      governance: {
+        requiresMakerReview: Boolean(fn.draftRelease),
+        requiresCheckerApproval: true,
+        executableBy: "JAVA_BACKEND_ONLY",
+      },
+    };
+  }
+
+  return {
+    schemaVersion: "1.0",
+    functionKey: fn.key,
+    functionName: fn.name,
+    executionType: "DECISION_TREE",
+    javaHandler: "RuleFunctionExecutionEngine.executeDecisionTree",
+    inputContract: Array.from(new Map(fnRules.flatMap(r=>r.inputs).map(f=>[f.name, {
+      name:f.name, type:f.type, required:f.required, description:f.desc,
+    }])).values()),
+    rootNodeId: "NODE-R-PRESTR-001",
+    customConditionNodes: (fn.conditionSteps ?? []).map(step=>({
+      nodeId: step.id,
+      nodeType: "CUSTOM_CONDITION",
+      name: step.name,
+      condition: { expression: step.condition },
+      onTrue: { flowId: step.trueFlowId, displayLabel: step.trueLabel },
+      onFalse: { flowId: step.falseFlowId, displayLabel: step.falseLabel },
+      makerNote: step.note ?? null,
+    })),
+    flows: [
+      { flowId:"RESTRICTION_BLOCK_FLOW", type:"TERMINAL", terminal:"NOT_RECOMMENDED" },
+      { flowId:"HARD_ELIGIBILITY_FLOW", type:"CONTINUE", startsAt:"NODE-R-HELIG-001" },
+      { flowId:"ELIGIBILITY_BLOCK_FLOW", type:"TERMINAL", terminal:"INELIGIBLE" },
+      { flowId:"SOFT_SUITABILITY_FLOW", type:"CONTINUE", startsAt:"NODE-R-SSUIT-001" },
+      { flowId:"WARNING_FLOW", type:"CONTINUE_WITH_WARNING", startsAt:"NODE-R-HVII-001" },
+      { flowId:"CLEAN_SUITABILITY_FLOW", type:"CONTINUE", startsAt:"NODE-R-HVII-001" },
+      { flowId:"ADJUSTED_RANKING_FLOW", type:"CONTINUE_WITH_OUTPUT", startsAt:"NODE-R-RANK-001" },
+      { flowId:"NEUTRAL_RANKING_FLOW", type:"CONTINUE_WITH_OUTPUT", startsAt:"NODE-R-RANK-001" },
+      { flowId:"ELIGIBLE_RECOMMENDATION_FLOW", type:"TERMINAL", terminal:"ELIGIBLE_WITH_RANK" },
+      { flowId:"MANUAL_REVIEW_FLOW", type:"TERMINAL", terminal:"MANUAL_REVIEW" },
+    ],
+    nodes: [
+      {
+        nodeId:"NODE-R-PRESTR-001",
+        ruleId:"R-PRESTR-001",
+        condition:{ field:"restrictedFlags", operator:"contains", value:"PRODUCT_BLOCKED", displayLabel:flowOverride("R-PRESTR-001").condition ?? "restrictedFlags contains PRODUCT_BLOCKED" },
+        onTrue:{ flowId:flowOverride("R-PRESTR-001").trueFlowId ?? "RESTRICTION_BLOCK_FLOW", terminal:"NOT_RECOMMENDED", reasonCode:"IDEA-RESTRICTED", displayLabel:flowOverride("R-PRESTR-001").trueLabel ?? "Not Recommended" },
+        onFalse:{ flowId:flowOverride("R-PRESTR-001").falseFlowId ?? "HARD_ELIGIBILITY_FLOW", nextNodeId:"NODE-R-HELIG-001", displayLabel:flowOverride("R-PRESTR-001").falseLabel ?? "Hard Eligibility Flow" },
+      },
+      {
+        nodeId:"NODE-R-HELIG-001",
+        ruleId:"R-HELIG-001",
+        condition:{ any:[
+          { field:"productRiskRating", operator:">", value:4 },
+          { field:"jurisdiction", operator:"notIn", value:["SG","HK","MY","TH"] },
+        ], displayLabel:flowOverride("R-HELIG-001").condition ?? "productRiskRating > tolerance OR jurisdiction unsupported" },
+        onTrue:{ flowId:flowOverride("R-HELIG-001").trueFlowId ?? "ELIGIBILITY_BLOCK_FLOW", terminal:"INELIGIBLE", reasonCode:"IDEA-CIP-BLOCK", displayLabel:flowOverride("R-HELIG-001").trueLabel ?? "Ineligible" },
+        onFalse:{ flowId:flowOverride("R-HELIG-001").falseFlowId ?? "SOFT_SUITABILITY_FLOW", nextNodeId:"NODE-R-SSUIT-001", displayLabel:flowOverride("R-HELIG-001").falseLabel ?? "Soft Suitability Flow" },
+      },
+      {
+        nodeId:"NODE-R-SSUIT-001",
+        ruleId:"R-SSUIT-001",
+        condition:{ field:"holdingConcentration", operator:">", value:25, displayLabel:flowOverride("R-SSUIT-001").condition ?? "holdingConcentration > 25" },
+        onTrue:{ flowId:flowOverride("R-SSUIT-001").trueFlowId ?? "WARNING_FLOW", nextNodeId:"NODE-R-HVII-001", addWarning:"IDEA-CONCENTRATION-WARN", displayLabel:flowOverride("R-SSUIT-001").trueLabel ?? "Warning Flow" },
+        onFalse:{ flowId:flowOverride("R-SSUIT-001").falseFlowId ?? "CLEAN_SUITABILITY_FLOW", nextNodeId:"NODE-R-HVII-001", displayLabel:flowOverride("R-SSUIT-001").falseLabel ?? "Clean Suitability Flow" },
+      },
+      {
+        nodeId:"NODE-R-HVII-001",
+        ruleId:"R-HVII-001",
+        condition:{ field:"houseView", operator:"in", value:["OW","N","UW"], displayLabel:flowOverride("R-HVII-001").condition ?? "houseView is OW, N, or UW" },
+        onTrue:{ flowId:flowOverride("R-HVII-001").trueFlowId ?? "ADJUSTED_RANKING_FLOW", nextNodeId:"NODE-R-RANK-001", output:"hvAdjustment", displayLabel:flowOverride("R-HVII-001").trueLabel ?? "Adjusted Ranking Flow" },
+        onFalse:{ flowId:flowOverride("R-HVII-001").falseFlowId ?? "NEUTRAL_RANKING_FLOW", nextNodeId:"NODE-R-RANK-001", output:"hvAdjustment=0", displayLabel:flowOverride("R-HVII-001").falseLabel ?? "Neutral Ranking Flow" },
+      },
+      {
+        nodeId:"NODE-R-RANK-001",
+        ruleId:"R-RANK-001",
+        condition:{ field:"eligible", operator:"=", value:true, displayLabel:flowOverride("R-RANK-001").condition ?? "eligible = true" },
+        onTrue:{ flowId:flowOverride("R-RANK-001").trueFlowId ?? "ELIGIBLE_RECOMMENDATION_FLOW", terminal:"ELIGIBLE_WITH_RANK", outputs:["recommendationRank","advisorMessage","rankReasonCode"], displayLabel:flowOverride("R-RANK-001").trueLabel ?? "Eligible Recommendation Flow" },
+        onFalse:{ flowId:flowOverride("R-RANK-001").falseFlowId ?? "MANUAL_REVIEW_FLOW", terminal:"MANUAL_REVIEW", reasonCode:"IDEA-MANUAL-REVIEW", displayLabel:flowOverride("R-RANK-001").falseLabel ?? "Manual Review Flow" },
+      },
+    ],
+    terminalOutput: ["eligible","recommendationRank","advisorMessage","reasonCodes","warnings"],
+    governance: {
+      requiresMakerReview: Boolean(fn.draftRelease),
+      requiresCheckerApproval: true,
+      executableBy: "JAVA_BACKEND_ONLY",
+    },
+  };
+}
+
 // ─── Left Navigation ──────────────────────────────────────────────────────────
 
 const NAV_ITEMS = [
@@ -922,6 +1111,56 @@ function buildAiStructuredRuleSpec(rule: Rule, sourceText: string) {
   };
 }
 
+function buildRuleFromLogicText(logicText: string, sequence: number): Rule {
+  const clean = logicText.trim();
+  const titleMatch = clean.match(/(?:rule|name)\s*[:=-]\s*([^\n.]+)/i);
+  const name = (titleMatch?.[1]?.trim() || clean.split(/[.\n]/)[0]?.trim() || "AI Generated Rule").slice(0, 64);
+  const upper = clean.toUpperCase();
+  const type: Rule["type"] =
+    upper.includes("EXCLUDE") || upper.includes("BLOCK") || upper.includes("RESTRICT") ? "ExclusionList" :
+    upper.includes("LOOKUP") || upper.includes("REFERENCE") ? "LookupTable" :
+    upper.includes("RANK") ? "RankingMatrix" :
+    upper.includes("THRESHOLD") || upper.includes(">") || upper.includes("<") ? "ThresholdMatrix" :
+    upper.includes("ELIGIBLE") || upper.includes("IF ") || upper.includes(" WHEN ") ? "DecisionTable" :
+    "ScoringMatrix";
+  const category: Rule["category"] =
+    type === "RankingMatrix" ? "ranking" :
+    type === "DecisionTable" || type === "ExclusionList" ? "eligibility" :
+    "scoring";
+  const fieldCandidates = Array.from(new Set(
+    Array.from(clean.matchAll(/\b([a-z][a-zA-Z0-9_]{2,})\b/g))
+      .map(m=>m[1])
+      .filter(w=>!["rule","when","then","else","score","rating","output","reason","client","product","should","return","true","false","and","or","not","with","from","into","than"].includes(w.toLowerCase()))
+      .slice(0, 4)
+  ));
+  const inputs = (fieldCandidates.length ? fieldCandidates : ["inputValue"]).map((name, i)=>({
+    name,
+    type: (/(flag|list|codes|tags)$/i.test(name) ? "array" : /(is|has|eligible|blocked)/i.test(name) ? "boolean" : /(score|amount|ratio|pct|percent|value|age|aum|risk|rank|rating)/i.test(name) ? "number" : "string") as IOField["type"],
+    required: i === 0,
+    desc: `AI-detected input from maker logic text: ${name}`,
+    sample: /(flag|list|codes|tags)$/i.test(name) ? "[]" : /(is|has|eligible|blocked)/i.test(name) ? "false" : /(score|amount|ratio|pct|percent|value|age|aum|risk|rank|rating)/i.test(name) ? "1" : "Sample",
+  }));
+  const outputBase = name.replace(/[^a-zA-Z0-9]+(.)/g, (_, c)=>String(c).toUpperCase()).replace(/^[A-Z]/, c=>c.toLowerCase()).slice(0, 32) || "aiRule";
+  const id = `R-AI-${String(sequence).padStart(3, "0")}`;
+  return {
+    id,
+    name,
+    shortName: name.length > 18 ? `${name.slice(0, 18)}...` : name,
+    type,
+    category,
+    version: "v0.1-draft",
+    lastModified: "21 Jun 2026",
+    usedBy: [],
+    modified: true,
+    desc: `AI-generated maker draft from pasted business logic. ${clean.slice(0, 160)}${clean.length > 160 ? "..." : ""}`,
+    inputs,
+    outputs: [
+      { name:`${outputBase}Result`, type:type === "ExclusionList" || type === "DecisionTable" ? "boolean" : "number", required:true, desc:"Primary AI-generated rule output", sample:type === "ExclusionList" || type === "DecisionTable" ? "false" : "3" },
+      { name:`${outputBase}ReasonCode`, type:"string", required:true, desc:"Reason code for trace and audit", sample:`${id}-001` },
+    ],
+  };
+}
+
 function RuleLogicTabs({ rule, savedDraft, defaultDraft }: { rule: Rule; savedDraft?: string; defaultDraft: string }) {
   const tabs = savedDraft
     ? ["Business Logic","AI Structured JSON","Validation","Local Draft"]
@@ -1276,19 +1515,88 @@ function TreeBox({
   );
 }
 
+function BranchOutcome({
+  label, title, detail, variant = "pass",
+}: {
+  label: string;
+  title: string;
+  detail: string;
+  variant?: "pass"|"warn"|"fail"|"default";
+}) {
+  const cls: Record<string, string> = {
+    pass: "bg-green-50 border-green-200 text-green-800",
+    warn: "bg-amber-50 border-amber-200 text-amber-800",
+    fail: "bg-red-50 border-red-200 text-red-800",
+    default: "bg-gray-50 border-gray-200 text-gray-800",
+  };
+  const labelCls: Record<string, string> = {
+    pass: "text-green-600",
+    warn: "text-amber-600",
+    fail: "text-red-600",
+    default: "text-gray-500",
+  };
+  return (
+    <div className={`border rounded-lg px-3 py-2 text-center shadow-sm ${cls[variant]}`}>
+      <div className={`text-[9px] font-bold uppercase tracking-wide ${labelCls[variant]}`}>{label}</div>
+      <div className="text-xs font-semibold mt-0.5">{title}</div>
+      <div className="text-[10px] mt-0.5 opacity-80 leading-tight">{detail}</div>
+    </div>
+  );
+}
+
 /** Portfolio Strength — parallel scoring tree */
 function PSDecisionTree({ fn, rules }: { fn: RuleFunctionDef; rules: Rule[] }) {
-  const scoring = rules.filter(r => r.type !== "WeightedAggregation");
+  const exceptionRule = rules.find(r => r.id === "R-NTW-001");
+  const scoring = rules.filter(r => r.type !== "WeightedAggregation" && r.id !== "R-NTW-001");
 
   return (
-    <div className="flex-1 overflow-auto p-6 bg-[#F1F4F8]">
+    <div className="p-6">
       <div className="min-w-[700px] max-w-5xl mx-auto flex flex-col items-center">
 
         {/* Input */}
         <TreeBox variant="root" tag="Input" label="Client Portfolio Data"
           sublabel="cip · totalAUM · saaAllocation · houseViewAlignment · esgScore…" />
 
-        <TreeConnector label="Parallel evaluation — all rule families run independently" width="wide" />
+        {exceptionRule && (
+          <>
+            <TreeConnector label="Evaluate exception condition" />
+            <div className="bg-gray-50 border-2 border-gray-300 rounded-lg px-5 py-3 text-center shadow-sm w-72">
+              <div className="mb-1">
+                <span className={`text-[9px] px-1 py-0.5 rounded border font-medium ${ruleTypeCls[exceptionRule.type] ?? ""}`}>{exceptionRule.type}</span>
+              </div>
+              <div className="text-sm font-semibold text-gray-900">{exceptionRule.shortName}</div>
+              <div className="text-[10px] text-gray-500 mt-0.5">Condition: exceptionFlags present or NTW treatment required</div>
+              {fn.weights?.[exceptionRule.id] !== undefined && (
+                <div className="mt-1.5 text-xs font-bold text-[#1E3A6B]">{fn.weights[exceptionRule.id]}%</div>
+              )}
+            </div>
+
+            <div className="w-full max-w-2xl mt-3">
+              <div className="grid grid-cols-2 gap-6">
+                <div className="flex flex-col items-center">
+                  <div className="w-px h-4 bg-gray-300"/>
+                  <BranchOutcome
+                    label="TRUE"
+                    title="Exception Treatment Flow"
+                    detail="Apply NTW/exception handling; may terminate or flag output."
+                    variant="warn"
+                  />
+                </div>
+                <div className="flex flex-col items-center">
+                  <div className="w-px h-4 bg-gray-300"/>
+                  <BranchOutcome
+                    label="FALSE"
+                    title="Parallel Scoring Flow"
+                    detail="Continue to rating rule families and weighted aggregation."
+                    variant="pass"
+                  />
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+
+        <TreeConnector label="FALSE branch continues to parallel scoring families" width="wide" />
 
         {/* Top horizontal bar */}
         <div className="w-full border-t-2 border-gray-300 relative">
@@ -1355,16 +1663,56 @@ function PSDecisionTree({ fn, rules }: { fn: RuleFunctionDef; rules: Rule[] }) {
 /** Investment Idea — sequential decision tree */
 function IIDecisionTree({ rules }: { rules: Rule[] }) {
   const steps = [
-    { ruleId:"R-PRESTR-001", failLabel:"Not Recommended", failCode:"IDEA-RESTRICTED",         failType:"fail" as const, passNote:"No restrictions apply" },
-    { ruleId:"R-HELIG-001",  failLabel:"Ineligible",      failCode:"IDEA-CIP-BLOCK",           failType:"fail" as const, passNote:"All eligibility checks pass" },
-    { ruleId:"R-SSUIT-001",  failLabel:"Suitable with Warnings", failCode:"IDEA-CONCENTRATION-WARN", failType:"warn" as const, passNote:"No suitability warnings" },
-    { ruleId:"R-HVII-001",   failLabel:"Rank adjusted",   failCode:"IDEA-HV-ADJ",              failType:"warn" as const, passNote:"Rank applied" },
+    {
+      ruleId:"R-PRESTR-001",
+      condition:"restrictedFlags contains PRODUCT_BLOCKED",
+      trueTitle:"Not Recommended",
+      trueDetail:"Terminal flow · IDEA-RESTRICTED",
+      trueVariant:"fail" as const,
+      falseTitle:"Hard Eligibility Flow",
+      falseDetail:"No restriction found; continue to eligibility checks.",
+      falseVariant:"pass" as const,
+      continueLabel:"FALSE branch enters Hard Eligibility Flow",
+    },
+    {
+      ruleId:"R-HELIG-001",
+      condition:"productRiskRating > tolerance OR jurisdiction unsupported",
+      trueTitle:"Ineligible",
+      trueDetail:"Terminal flow · IDEA-CIP-BLOCK",
+      trueVariant:"fail" as const,
+      falseTitle:"Soft Suitability Flow",
+      falseDetail:"Eligibility passed; continue to warning checks.",
+      falseVariant:"pass" as const,
+      continueLabel:"FALSE branch enters Soft Suitability Flow",
+    },
+    {
+      ruleId:"R-SSUIT-001",
+      condition:"concentration, liquidity, or risk warning exists",
+      trueTitle:"Warning Flow",
+      trueDetail:"Add warning code, then continue to house view.",
+      trueVariant:"warn" as const,
+      falseTitle:"Clean Suitability Flow",
+      falseDetail:"No warning; continue to house view.",
+      falseVariant:"pass" as const,
+      continueLabel:"Both branches continue to House View flow",
+    },
+    {
+      ruleId:"R-HVII-001",
+      condition:"houseView is OW or UW",
+      trueTitle:"Adjusted Ranking Flow",
+      trueDetail:"Apply house-view adjustment before ranking.",
+      trueVariant:"warn" as const,
+      falseTitle:"Neutral Ranking Flow",
+      falseDetail:"No adjustment; continue to ranking.",
+      falseVariant:"pass" as const,
+      continueLabel:"Both branches continue to Ranking flow",
+    },
   ];
   const rankRule = rules.find(r => r.id === "R-RANK-001");
 
   return (
-    <div className="flex-1 overflow-auto p-6 bg-[#F1F4F8]">
-      <div className="max-w-xl mx-auto flex flex-col items-center">
+    <div className="p-6">
+      <div className="max-w-3xl mx-auto flex flex-col items-center">
         <TreeBox variant="root" tag="Input" label="Client Profile + Product Attributes"
           sublabel="cip · productRiskRating · holdingConcentration · houseView…" />
 
@@ -1373,47 +1721,35 @@ function IIDecisionTree({ rules }: { rules: Rule[] }) {
           if (!rule) return null;
           return (
             <div key={step.ruleId} className="w-full flex flex-col items-center">
-              <TreeConnector />
-              {/* Decision node + branch */}
-              <div className="w-full flex items-center gap-0">
-                {/* Main node */}
-                <div className="flex-1">
-                  <div className={`border-2 rounded-lg p-3 text-center shadow-sm ${rule.type === "ExclusionList" ? "border-red-300 bg-red-50/50" : "border-gray-200 bg-white"}`}>
-                    <div className="mb-1">
-                      <span className={`text-[9px] px-1 py-0.5 rounded border font-medium ${ruleTypeCls[rule.type] ?? ""}`}>{rule.type}</span>
-                    </div>
-                    <div className="text-sm font-semibold text-gray-900">{rule.name}</div>
-                    <div className="text-[10px] text-gray-400 mt-0.5">{rule.inputs.map(f => f.name).slice(0, 3).join(" · ")}</div>
-                  </div>
+              <TreeConnector label={step.condition} width="wide" />
+              <div className={`border-2 rounded-lg p-3 text-center shadow-sm w-80 ${rule.type === "ExclusionList" ? "border-red-300 bg-red-50/50" : "border-gray-200 bg-white"}`}>
+                <div className="mb-1">
+                  <span className={`text-[9px] px-1 py-0.5 rounded border font-medium ${ruleTypeCls[rule.type] ?? ""}`}>{rule.type}</span>
                 </div>
+                <div className="text-sm font-semibold text-gray-900">{rule.name}</div>
+                <div className="text-[10px] text-gray-400 mt-0.5">{rule.inputs.map(f => f.name).slice(0, 3).join(" · ")}</div>
+              </div>
 
-                {/* Branch arrow right */}
-                <div className="flex items-center flex-shrink-0 ml-2">
-                  <div className="h-px w-8 bg-gray-400" />
-                  <CornerDownRight size={12} className="text-gray-400 -ml-1" />
-                  <div className={`border rounded-lg px-3 py-2 text-center ml-1 ${step.failType === "fail" ? "bg-red-50 border-red-200" : "bg-amber-50 border-amber-200"}`}>
-                    <div className={`text-[9px] font-bold uppercase tracking-wide ${step.failType === "fail" ? "text-red-500" : "text-amber-500"}`}>
-                      {step.failType === "fail" ? "FAIL / BLOCK" : "WARN"}
-                    </div>
-                    <div className={`text-xs font-semibold mt-0.5 ${step.failType === "fail" ? "text-red-800" : "text-amber-800"}`}>{step.failLabel}</div>
-                    <div className={`text-[9px] font-mono mt-0.5 ${step.failType === "fail" ? "text-red-400" : "text-amber-400"}`}>{step.failCode}</div>
+              <div className="w-full mt-3">
+                <div className="grid grid-cols-2 gap-6">
+                  <div className="flex flex-col items-center">
+                    <div className="w-px h-4 bg-gray-300"/>
+                    <BranchOutcome label="TRUE" title={step.trueTitle} detail={step.trueDetail} variant={step.trueVariant}/>
+                  </div>
+                  <div className="flex flex-col items-center">
+                    <div className="w-px h-4 bg-gray-300"/>
+                    <BranchOutcome label="FALSE" title={step.falseTitle} detail={step.falseDetail} variant={step.falseVariant}/>
                   </div>
                 </div>
               </div>
 
-              {/* PASS label */}
-              <div className="flex items-center gap-1.5 mt-1">
-                <div className="w-px h-2 bg-gray-300" />
-              </div>
-              <span className="text-[10px] font-medium text-green-700 bg-green-50 border border-green-200 rounded px-2 py-0.5">
-                ✓ {step.passNote}
-              </span>
+              <TreeConnector label={step.continueLabel} />
             </div>
           );
         })}
 
         {/* Ranking */}
-        <TreeConnector />
+        <TreeConnector label="eligible = true" width="wide" />
         <div className="bg-white border-2 border-indigo-300 rounded-lg px-5 py-3 text-center shadow-sm w-72">
           <div className="mb-1">
             <span className={`text-[9px] px-1 py-0.5 rounded border font-medium ${ruleTypeCls["RankingMatrix"]}`}>RankingMatrix</span>
@@ -1422,7 +1758,30 @@ function IIDecisionTree({ rules }: { rules: Rule[] }) {
           <div className="text-[10px] text-gray-400 mt-0.5">CIP + houseView + objective → Rank 1–5</div>
         </div>
 
-        <TreeConnector />
+        <div className="w-full max-w-2xl mt-3">
+          <div className="grid grid-cols-2 gap-6">
+            <div className="flex flex-col items-center">
+              <div className="w-px h-4 bg-gray-300"/>
+              <BranchOutcome
+                label="TRUE"
+                title="Eligible Recommendation Flow"
+                detail="Terminal output includes rank, advisor message, and reason codes."
+                variant="pass"
+              />
+            </div>
+            <div className="flex flex-col items-center">
+              <div className="w-px h-4 bg-gray-300"/>
+              <BranchOutcome
+                label="FALSE"
+                title="Manual Review Flow"
+                detail="Terminal output flags manual review with reason code."
+                variant="warn"
+              />
+            </div>
+          </div>
+        </div>
+
+        <TreeConnector label="Terminal output" />
         <TreeBox variant="output" tag="Output" label="Eligible · Rank · Advisor Message"
           sublabel="eligible · recommendationRank · reasonCodes · advisorMessage" />
       </div>
@@ -1433,36 +1792,196 @@ function IIDecisionTree({ rules }: { rules: Rule[] }) {
 /** Dispatcher: picks the right tree view for the function */
 function DecisionTreeView({ fn, allRules }: { fn: RuleFunctionDef; allRules: Rule[] }) {
   const fnRules = fn.ruleIds.map(id => allRules.find(r => r.id === id)).filter(Boolean) as Rule[];
-  if (fn.key === "PS") return <PSDecisionTree fn={fn} rules={fnRules} />;
-  return <IIDecisionTree rules={fnRules} />;
+  return (
+    <div className="flex flex-col h-full overflow-hidden">
+      <div className="flex-1 min-h-0 overflow-auto bg-[#F1F4F8]">
+        {fn.key === "PS" ? <PSDecisionTree fn={fn} rules={fnRules} /> : <IIDecisionTree rules={fnRules} />}
+      </div>
+      <div className="border-t border-gray-200 bg-white p-3 flex-shrink-0">
+        <FunctionExecutionJsonPanel fn={fn} allRules={allRules} compact/>
+      </div>
+    </div>
+  );
+}
+
+function FunctionExecutionJsonPanel({ fn, allRules, compact=false }: { fn: RuleFunctionDef; allRules: Rule[]; compact?: boolean }) {
+  const spec = buildRuleFunctionExecutionSpec(fn, allRules);
+  return (
+    <div className="bg-white border border-gray-200 rounded overflow-hidden">
+      <div className="px-3 py-2 border-b border-gray-200 flex items-center gap-2">
+        <Code2 size={12} className="text-[#1E3A6B]"/>
+        <div>
+          <div className="text-xs font-semibold text-gray-900">Backend Java Execution JSON</div>
+          <div className="text-[10px] text-gray-500">Embedded by the Java rule engine through <code className="font-mono">{spec.javaHandler}</code>.</div>
+        </div>
+        <span className="ml-auto text-[10px] bg-blue-50 text-blue-700 border border-blue-200 rounded px-1.5 py-0.5">{spec.executionType}</span>
+      </div>
+      <pre className={`${compact?"max-h-40":"max-h-[360px]"} overflow-auto bg-slate-950 text-slate-100 p-3 text-[11px] leading-relaxed font-mono`}>
+        {JSON.stringify(spec, null, 2)}
+      </pre>
+    </div>
+  );
 }
 
 // ─── Function Flow Builder ────────────────────────────────────────────────────
 
-function FlowBuilderTab({ fn, allRules, onAddRule, onRemoveRule, onMoveRule }:{
+function FlowBuilderTab({ fn, allRules, onAddRule, onRemoveRule, onMoveRule, onAddCondition, onRemoveCondition, onUpdateRuleFlow }:{
   fn: RuleFunctionDef; allRules: Rule[];
   onAddRule:(ruleId:string)=>void; onRemoveRule:(ruleId:string)=>void; onMoveRule:(ruleId:string,dir:"up"|"down")=>void;
+  onAddCondition:(condition:NonNullable<RuleFunctionDef["conditionSteps"]>[number])=>void;
+  onRemoveCondition:(conditionId:string)=>void;
+  onUpdateRuleFlow:(ruleId:string, patch:NonNullable<RuleFunctionDef["flowOverrides"]>[string], weight?:number|null)=>void;
 }) {
   const [showPicker, setShowPicker] = useState(false);
+  const [showConditionBuilder, setShowConditionBuilder] = useState(false);
   const [pickerSearch, setPickerSearch] = useState("");
+  const [conditionForm, setConditionForm] = useState({
+    name: "New Condition",
+    condition: "field operator value",
+    trueFlowId: "TRUE_FLOW",
+    trueLabel: "Continue on TRUE",
+    falseFlowId: "FALSE_FLOW",
+    falseLabel: "Continue on FALSE",
+    note: "",
+  });
+  const [editingRuleId, setEditingRuleId] = useState<string|null>(null);
+  const [editForm, setEditForm] = useState({
+    condition: "",
+    trueFlowId: "",
+    trueLabel: "",
+    falseFlowId: "",
+    falseLabel: "",
+    note: "",
+    weight: "",
+  });
   const fnRules = fn.ruleIds.map(id=>allRules.find(r=>r.id===id)).filter(Boolean) as Rule[];
   const available = allRules.filter(r=>!fn.ruleIds.includes(r.id)&&r.id!=="R-OVERALL-001");
   const filtered = available.filter(r=>r.name.toLowerCase().includes(pickerSearch.toLowerCase()));
 
   const isPS = fn.key === "PS";
+  const iiConditions: Record<string, { condition:string; trueFlowId:string; trueLabel:string; falseFlowId:string; falseLabel:string; trueTone:"fail"|"warn"; falseTone:"pass"|"warn" }> = {
+    "R-PRESTR-001": { condition:"restrictedFlags contains PRODUCT_BLOCKED", trueFlowId:"RESTRICTION_BLOCK_FLOW", trueLabel:"Terminal: NOT_RECOMMENDED", falseFlowId:"HARD_ELIGIBILITY_FLOW", falseLabel:"Continue to hard eligibility", trueTone:"fail", falseTone:"pass" },
+    "R-HELIG-001": { condition:"productRiskRating > 4 OR jurisdiction not supported", trueFlowId:"ELIGIBILITY_BLOCK_FLOW", trueLabel:"Terminal: INELIGIBLE", falseFlowId:"SOFT_SUITABILITY_FLOW", falseLabel:"Continue to soft suitability", trueTone:"fail", falseTone:"pass" },
+    "R-SSUIT-001": { condition:"holdingConcentration > 25 OR liquidity/risk warning", trueFlowId:"WARNING_FLOW", trueLabel:"Add warning, then continue", falseFlowId:"CLEAN_SUITABILITY_FLOW", falseLabel:"Continue without warning", trueTone:"warn", falseTone:"pass" },
+    "R-HVII-001": { condition:"houseView in OW/N/UW", trueFlowId:"ADJUSTED_RANKING_FLOW", trueLabel:"Apply house-view rank adjustment", falseFlowId:"NEUTRAL_RANKING_FLOW", falseLabel:"Default to neutral ranking", trueTone:"warn", falseTone:"pass" },
+    "R-RANK-001": { condition:"eligible = true", trueFlowId:"ELIGIBLE_RECOMMENDATION_FLOW", trueLabel:"Terminal: ELIGIBLE_WITH_RANK", falseFlowId:"MANUAL_REVIEW_FLOW", falseLabel:"Terminal: MANUAL_REVIEW", trueTone:"pass", falseTone:"warn" },
+  };
+  const editingRule = editingRuleId ? fnRules.find(r=>r.id===editingRuleId) : null;
+  const flowDisplay = (ruleId:string) => {
+    const base = iiConditions[ruleId];
+    const override = fn.flowOverrides?.[ruleId];
+    return {
+      condition: override?.condition ?? base?.condition ?? "Execute rule",
+      trueFlowId: override?.trueFlowId ?? base?.trueFlowId ?? "TRUE_FLOW",
+      trueLabel: override?.trueLabel ?? base?.trueLabel ?? "TRUE branch",
+      falseFlowId: override?.falseFlowId ?? base?.falseFlowId ?? "FALSE_FLOW",
+      falseLabel: override?.falseLabel ?? base?.falseLabel ?? "FALSE branch",
+      trueTone: base?.trueTone ?? "warn",
+      falseTone: base?.falseTone ?? "pass",
+      note: override?.note ?? "",
+    };
+  };
+  const openEdit = (rule: Rule) => {
+    const flow = flowDisplay(rule.id);
+    setEditingRuleId(rule.id);
+    setEditForm({
+      condition: flow.condition,
+      trueFlowId: flow.trueFlowId,
+      trueLabel: flow.trueLabel,
+      falseFlowId: flow.falseFlowId,
+      falseLabel: flow.falseLabel,
+      note: flow.note,
+      weight: fn.weights?.[rule.id] !== undefined ? String(fn.weights[rule.id]) : "",
+    });
+  };
+  const saveEdit = () => {
+    if (!editingRule) return;
+    const weightValue = editForm.weight.trim()==="" ? null : Number(editForm.weight);
+    onUpdateRuleFlow(editingRule.id, {
+      condition: editForm.condition.trim(),
+      trueFlowId: editForm.trueFlowId.trim(),
+      trueLabel: editForm.trueLabel.trim(),
+      falseFlowId: editForm.falseFlowId.trim(),
+      falseLabel: editForm.falseLabel.trim(),
+      note: editForm.note.trim(),
+    }, Number.isFinite(weightValue) ? weightValue : null);
+    setEditingRuleId(null);
+  };
+  const resetConditionForm = () => setConditionForm({
+    name: "New Condition",
+    condition: "field operator value",
+    trueFlowId: "TRUE_FLOW",
+    trueLabel: "Continue on TRUE",
+    falseFlowId: "FALSE_FLOW",
+    falseLabel: "Continue on FALSE",
+    note: "",
+  });
+  const saveCondition = () => {
+    const id = `COND-${Date.now().toString(36).toUpperCase()}`;
+    onAddCondition({
+      id,
+      name: conditionForm.name.trim() || "New Condition",
+      condition: conditionForm.condition.trim() || "field operator value",
+      trueFlowId: conditionForm.trueFlowId.trim() || "TRUE_FLOW",
+      trueLabel: conditionForm.trueLabel.trim() || "Continue on TRUE",
+      falseFlowId: conditionForm.falseFlowId.trim() || "FALSE_FLOW",
+      falseLabel: conditionForm.falseLabel.trim() || "Continue on FALSE",
+      note: conditionForm.note.trim(),
+    });
+    setShowConditionBuilder(false);
+    resetConditionForm();
+  };
+  const conditionStepCards = (
+    <div className="space-y-2 mb-3">
+      {(fn.conditionSteps ?? []).map(step=>(
+        <div key={step.id} className="bg-white border border-blue-200 rounded p-3 flex items-start gap-3">
+          <div className="w-6 h-6 rounded-full bg-blue-50 text-blue-700 text-[10px] font-bold flex items-center justify-center flex-shrink-0 mt-0.5">
+            <GitBranch size={12}/>
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold text-gray-900">{step.name}</span>
+              <span className="text-[9px] px-1.5 py-0.5 rounded border bg-blue-50 text-blue-700 border-blue-200 font-medium">Condition</span>
+            </div>
+            <div className="mt-2 grid grid-cols-3 gap-2 text-[10px]">
+              <div className="bg-gray-50 border border-gray-200 rounded px-2 py-1.5">
+                <div className="font-semibold text-gray-500 uppercase tracking-wide mb-0.5">Expression</div>
+                <div className="text-gray-700 font-mono">{step.condition}</div>
+              </div>
+              <div className="bg-green-50 border border-green-200 rounded px-2 py-1.5">
+                <div className="font-semibold text-green-700 uppercase tracking-wide mb-0.5">TRUE → {step.trueFlowId}</div>
+                <div className="text-green-800">{step.trueLabel}</div>
+              </div>
+              <div className="bg-amber-50 border border-amber-200 rounded px-2 py-1.5">
+                <div className="font-semibold text-amber-700 uppercase tracking-wide mb-0.5">FALSE → {step.falseFlowId}</div>
+                <div className="text-amber-800">{step.falseLabel}</div>
+              </div>
+            </div>
+            {step.note && <div className="mt-2 text-[10px] text-gray-500 bg-blue-50 border border-blue-100 rounded px-2 py-1">{step.note}</div>}
+          </div>
+          <button onClick={()=>onRemoveCondition(step.id)} className="p-1 text-gray-300 hover:text-red-500"><Trash2 size={12}/></button>
+        </div>
+      ))}
+    </div>
+  );
 
   return (
-    <div className="flex-1 overflow-auto p-4 bg-[#F1F4F8]">
+    <div className="h-full overflow-y-auto overflow-x-hidden p-4 bg-[#F1F4F8]">
       <div className="flex items-center justify-between mb-4">
         <div>
           <div className="text-sm font-semibold text-gray-900">Rule Flow</div>
           <div className="text-xs text-gray-500 mt-0.5">
-            {isPS ? "Rules execute in parallel → Overall Weighted Rating aggregates results." : "Rules execute sequentially — each can block or pass to the next step."}
+            {isPS ? "Rules execute in parallel, then the Java engine aggregates weighted results." : "Rules execute as a condition-based decision tree with pass, warning and terminal branches."}
           </div>
         </div>
-        <button onClick={()=>setShowPicker(true)} className="flex items-center gap-1.5 px-3 py-1.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059]">
-          <Plus size={12}/>Add Rule from Library
-        </button>
+        <div className="flex items-center gap-2">
+          <button onClick={()=>setShowConditionBuilder(true)} className="flex items-center gap-1.5 px-3 py-1.5 border border-[#1E3A6B]/30 text-[#1E3A6B] bg-white rounded text-xs font-medium hover:bg-blue-50">
+            <GitBranch size={12}/>Add Condition
+          </button>
+          <button onClick={()=>setShowPicker(true)} className="flex items-center gap-1.5 px-3 py-1.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059]">
+            <Plus size={12}/>Add Rule from Library
+          </button>
+        </div>
       </div>
 
       {/* Flow visualization */}
@@ -1470,6 +1989,7 @@ function FlowBuilderTab({ fn, allRules, onAddRule, onRemoveRule, onMoveRule }:{
         <div className="flex gap-4">
           {/* Parallel rules */}
           <div className="flex-1 space-y-2">
+            {conditionStepCards}
             {fnRules.filter(r=>r.id!=="R-OVERALL-001").map((rule,i,arr)=>(
               <div key={rule.id} className={`bg-white border rounded p-3 flex items-center gap-3 ${rule.modified?"border-amber-300":"border-gray-200"}`}>
                 <div className={`w-2 h-2 rounded-full flex-shrink-0 ${rule.modified?"bg-amber-500":"bg-gray-300"}`}/>
@@ -1483,8 +2003,12 @@ function FlowBuilderTab({ fn, allRules, onAddRule, onRemoveRule, onMoveRule }:{
                     Inputs: {rule.inputs.map(f=>f.name).join(", ")} → Output: {rule.outputs[0]?.name}
                     {fn.weights?.[rule.id]!==undefined&&<span className="ml-2 font-semibold text-[#1E3A6B]">Weight: {fn.weights[rule.id]}%</span>}
                   </div>
+                  {fn.flowOverrides?.[rule.id]?.note && (
+                    <div className="mt-2 text-[10px] text-gray-500 bg-blue-50 border border-blue-100 rounded px-2 py-1">{fn.flowOverrides[rule.id].note}</div>
+                  )}
                 </div>
                 <div className="flex items-center gap-1 flex-shrink-0">
+                  <button onClick={()=>openEdit(rule)} className="p-1 text-gray-400 hover:text-[#1E3A6B]" title="Edit flow step"><Edit3 size={12}/></button>
                   <button disabled={i===0} onClick={()=>onMoveRule(rule.id,"up")} className="p-1 text-gray-400 hover:text-gray-600 disabled:opacity-30"><ChevronUp size={12}/></button>
                   <button disabled={i===arr.length-1} onClick={()=>onMoveRule(rule.id,"down")} className="p-1 text-gray-400 hover:text-gray-600 disabled:opacity-30"><ChevronDown size={12}/></button>
                   <button onClick={()=>onRemoveRule(rule.id)} className="p-1 text-gray-300 hover:text-red-500 ml-1"><Trash2 size={12}/></button>
@@ -1506,24 +2030,38 @@ function FlowBuilderTab({ fn, allRules, onAddRule, onRemoveRule, onMoveRule }:{
           </div>
         </div>
       ) : (
-        /* Sequential flow for Investment Ideas */
-        <div className="max-w-xl space-y-0">
-          {fnRules.map((rule,i)=>(
+        /* Condition-based decision tree flow for Investment Ideas */
+        <div className="max-w-3xl space-y-2">
+          {conditionStepCards}
+          {fnRules.map((rule,i)=>{
+            const flow = flowDisplay(rule.id);
+            return (
             <div key={rule.id} className="flex flex-col items-stretch">
-              <div className={`bg-white border rounded p-3 flex items-center gap-3 ${rule.modified?"border-amber-300":"border-gray-200"}`}>
-                <div className="w-6 h-6 rounded-full bg-[#1E3A6B]/10 text-[#1E3A6B] text-[10px] font-bold flex items-center justify-center flex-shrink-0">{i+1}</div>
+              <div className={`bg-white border rounded p-3 flex items-start gap-3 ${rule.modified?"border-amber-300":"border-gray-200"}`}>
+                <div className="w-6 h-6 rounded-full bg-[#1E3A6B]/10 text-[#1E3A6B] text-[10px] font-bold flex items-center justify-center flex-shrink-0 mt-0.5">{i+1}</div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-medium text-gray-900">{rule.name}</span>
                     <RuleTypeBadge type={rule.type}/>
                   </div>
-                  <div className="text-[10px] text-gray-400 mt-0.5">
-                    {rule.inputs.map(f=>f.name).slice(0,3).join(", ")} → {rule.outputs[0]?.name}
-                    {rule.type==="ExclusionList"&&<span className="ml-2 text-red-500">Any match → BLOCKED</span>}
-                    {rule.type==="DecisionTable"&&<span className="ml-2 text-amber-600">First FAIL → blocked</span>}
+                  <div className="mt-2 grid grid-cols-3 gap-2 text-[10px]">
+                    <div className="bg-gray-50 border border-gray-200 rounded px-2 py-1.5">
+                      <div className="font-semibold text-gray-500 uppercase tracking-wide mb-0.5">Condition</div>
+                      <div className="text-gray-700 font-mono">{flow.condition}</div>
+                    </div>
+                    <div className={`${flow.trueTone==="fail"?"bg-red-50 border-red-200":flow.trueTone==="warn"?"bg-amber-50 border-amber-200":"bg-green-50 border-green-200"} border rounded px-2 py-1.5`}>
+                      <div className={`font-semibold uppercase tracking-wide mb-0.5 ${flow.trueTone==="fail"?"text-red-700":flow.trueTone==="warn"?"text-amber-700":"text-green-700"}`}>TRUE → {flow.trueFlowId}</div>
+                      <div className={flow.trueTone==="fail"?"text-red-800":flow.trueTone==="warn"?"text-amber-800":"text-green-800"}>{flow.trueLabel}</div>
+                    </div>
+                    <div className={`${flow.falseTone==="warn"?"bg-amber-50 border-amber-200":"bg-green-50 border-green-200"} border rounded px-2 py-1.5`}>
+                      <div className={`font-semibold uppercase tracking-wide mb-0.5 ${flow.falseTone==="warn"?"text-amber-700":"text-green-700"}`}>FALSE → {flow.falseFlowId}</div>
+                      <div className={flow.falseTone==="warn"?"text-amber-800":"text-green-800"}>{flow.falseLabel}</div>
+                    </div>
                   </div>
+                  {flow.note && <div className="mt-2 text-[10px] text-gray-500 bg-blue-50 border border-blue-100 rounded px-2 py-1">{flow.note}</div>}
                 </div>
                 <div className="flex items-center gap-1 flex-shrink-0">
+                  <button onClick={()=>openEdit(rule)} className="p-1 text-gray-400 hover:text-[#1E3A6B]" title="Edit flow step"><Edit3 size={12}/></button>
                   <button disabled={i===0} onClick={()=>onMoveRule(rule.id,"up")} className="p-1 text-gray-400 hover:text-gray-600 disabled:opacity-30"><ChevronUp size={12}/></button>
                   <button disabled={i===fnRules.length-1} onClick={()=>onMoveRule(rule.id,"down")} className="p-1 text-gray-400 hover:text-gray-600 disabled:opacity-30"><ChevronDown size={12}/></button>
                   <button onClick={()=>onRemoveRule(rule.id)} className="p-1 text-gray-300 hover:text-red-500 ml-1"><Trash2 size={12}/></button>
@@ -1531,7 +2069,184 @@ function FlowBuilderTab({ fn, allRules, onAddRule, onRemoveRule, onMoveRule }:{
               </div>
               {i<fnRules.length-1&&<div className="flex flex-col items-center my-0.5"><div className="w-px h-3 bg-gray-300"/><ArrowDown size={11} className="text-gray-400"/></div>}
             </div>
-          ))}
+          );})}
+        </div>
+      )}
+
+      <div className="mt-4">
+        <FunctionExecutionJsonPanel fn={fn} allRules={allRules}/>
+      </div>
+
+      {/* Add condition modal */}
+      {showConditionBuilder&&(
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{backgroundColor:"rgba(13,27,62,0.5)"}}>
+          <div className="bg-white rounded-lg shadow-2xl w-[620px] max-h-[78vh] flex flex-col">
+            <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
+              <div>
+                <div className="text-sm font-semibold text-gray-900">Add Condition</div>
+                <div className="text-xs text-gray-500 mt-0.5">Create a function-level branch condition for this rule flow</div>
+              </div>
+              <button onClick={()=>setShowConditionBuilder(false)} className="text-gray-400 hover:text-gray-600"><X size={16}/></button>
+            </div>
+            <div className="p-5 space-y-4 overflow-auto">
+              <div>
+                <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Condition Name</label>
+                <input
+                  value={conditionForm.name}
+                  onChange={e=>setConditionForm({...conditionForm, name:e.target.value})}
+                  className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B]"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Condition Expression</label>
+                <input
+                  value={conditionForm.condition}
+                  onChange={e=>setConditionForm({...conditionForm, condition:e.target.value})}
+                  placeholder="Example: clientSegment = HNW AND riskScore > 4"
+                  className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B] font-mono"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-2 bg-gray-50 border border-gray-200 rounded p-3">
+                  <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">TRUE Branch</div>
+                  <input
+                    value={conditionForm.trueFlowId}
+                    onChange={e=>setConditionForm({...conditionForm, trueFlowId:e.target.value})}
+                    placeholder="Flow ID"
+                    className="w-full border border-gray-200 rounded px-2 py-1.5 text-[11px] outline-none focus:border-[#1E3A6B] font-mono"
+                  />
+                  <textarea
+                    value={conditionForm.trueLabel}
+                    onChange={e=>setConditionForm({...conditionForm, trueLabel:e.target.value})}
+                    rows={3}
+                    className="w-full border border-gray-200 rounded px-2 py-1.5 text-[11px] outline-none focus:border-[#1E3A6B] resize-none"
+                  />
+                </div>
+                <div className="space-y-2 bg-gray-50 border border-gray-200 rounded p-3">
+                  <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">FALSE Branch</div>
+                  <input
+                    value={conditionForm.falseFlowId}
+                    onChange={e=>setConditionForm({...conditionForm, falseFlowId:e.target.value})}
+                    placeholder="Flow ID"
+                    className="w-full border border-gray-200 rounded px-2 py-1.5 text-[11px] outline-none focus:border-[#1E3A6B] font-mono"
+                  />
+                  <textarea
+                    value={conditionForm.falseLabel}
+                    onChange={e=>setConditionForm({...conditionForm, falseLabel:e.target.value})}
+                    rows={3}
+                    className="w-full border border-gray-200 rounded px-2 py-1.5 text-[11px] outline-none focus:border-[#1E3A6B] resize-none"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Maker Note</label>
+                <textarea
+                  value={conditionForm.note}
+                  onChange={e=>setConditionForm({...conditionForm, note:e.target.value})}
+                  rows={3}
+                  placeholder="Optional rationale for this condition"
+                  className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B] resize-none"
+                />
+              </div>
+            </div>
+            <div className="px-5 py-3 border-t border-gray-200 flex items-center justify-end gap-2">
+              <button onClick={()=>setShowConditionBuilder(false)} className="px-3 py-1.5 border border-gray-200 rounded text-xs font-medium text-gray-600 hover:bg-gray-50">Cancel</button>
+              <button onClick={saveCondition} className="px-3 py-1.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059] flex items-center gap-1.5">
+                <GitBranch size={12}/>Add Condition
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Flow step edit modal */}
+      {editingRule&&(
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{backgroundColor:"rgba(13,27,62,0.5)"}}>
+          <div className="bg-white rounded-lg shadow-2xl w-[620px] max-h-[78vh] flex flex-col">
+            <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
+              <div>
+                <div className="text-sm font-semibold text-gray-900">Edit Rule Flow Step</div>
+                <div className="text-xs text-gray-500 mt-0.5">{editingRule.name} · {editingRule.id}</div>
+              </div>
+              <button onClick={()=>setEditingRuleId(null)} className="text-gray-400 hover:text-gray-600"><X size={16}/></button>
+            </div>
+            <div className="p-5 space-y-4 overflow-auto">
+              {isPS ? (
+                <div>
+                  <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Weight %</label>
+                  <input
+                    value={editForm.weight}
+                    onChange={e=>setEditForm({...editForm, weight:e.target.value})}
+                    inputMode="decimal"
+                    placeholder="Example: 15"
+                    className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B]"
+                  />
+                  <div className="text-[10px] text-gray-400 mt-1">Weight is stored on the rule function draft and reflected in the backend execution JSON.</div>
+                </div>
+              ) : (
+                <>
+                  <div>
+                    <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Condition Label</label>
+                    <input
+                      value={editForm.condition}
+                      onChange={e=>setEditForm({...editForm, condition:e.target.value})}
+                      className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B] font-mono"
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-2 bg-gray-50 border border-gray-200 rounded p-3">
+                      <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">TRUE Branch</div>
+                      <input
+                        value={editForm.trueFlowId}
+                        onChange={e=>setEditForm({...editForm, trueFlowId:e.target.value})}
+                        placeholder="Flow ID"
+                        className="w-full border border-gray-200 rounded px-2 py-1.5 text-[11px] outline-none focus:border-[#1E3A6B] font-mono"
+                      />
+                      <textarea
+                        value={editForm.trueLabel}
+                        onChange={e=>setEditForm({...editForm, trueLabel:e.target.value})}
+                        placeholder="Branch outcome"
+                        rows={3}
+                        className="w-full border border-gray-200 rounded px-2 py-1.5 text-[11px] outline-none focus:border-[#1E3A6B] resize-none"
+                      />
+                    </div>
+                    <div className="space-y-2 bg-gray-50 border border-gray-200 rounded p-3">
+                      <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">FALSE Branch</div>
+                      <input
+                        value={editForm.falseFlowId}
+                        onChange={e=>setEditForm({...editForm, falseFlowId:e.target.value})}
+                        placeholder="Flow ID"
+                        className="w-full border border-gray-200 rounded px-2 py-1.5 text-[11px] outline-none focus:border-[#1E3A6B] font-mono"
+                      />
+                      <textarea
+                        value={editForm.falseLabel}
+                        onChange={e=>setEditForm({...editForm, falseLabel:e.target.value})}
+                        placeholder="Branch outcome"
+                        rows={3}
+                        className="w-full border border-gray-200 rounded px-2 py-1.5 text-[11px] outline-none focus:border-[#1E3A6B] resize-none"
+                      />
+                    </div>
+                  </div>
+                </>
+              )}
+              <div>
+                <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Maker Note</label>
+                <textarea
+                  value={editForm.note}
+                  onChange={e=>setEditForm({...editForm, note:e.target.value})}
+                  rows={3}
+                  placeholder="Optional rationale for this flow-step edit"
+                  className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B] resize-none"
+                />
+              </div>
+            </div>
+            <div className="px-5 py-3 border-t border-gray-200 flex items-center justify-end gap-2">
+              <button onClick={()=>setEditingRuleId(null)} className="px-3 py-1.5 border border-gray-200 rounded text-xs font-medium text-gray-600 hover:bg-gray-50">Cancel</button>
+              <button onClick={saveEdit} className="px-3 py-1.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059] flex items-center gap-1.5">
+                <Save size={12}/>Save Flow Edit
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -2039,10 +2754,36 @@ function RuleFunctionView({ fn, setFn, allRules, testCases, onSaveTestCase, onDe
 
   const addRule = (ruleId:string) => setFn({...fn, ruleIds:[...fn.ruleIds, ruleId]});
   const removeRule = (ruleId:string) => setFn({...fn, ruleIds:fn.ruleIds.filter(id=>id!==ruleId)});
+  const markFunctionDraft = (patch: Partial<RuleFunctionDef>) => setFn({
+    ...fn,
+    ...patch,
+    draftRelease: fn.draftRelease ?? `${fn.activeRelease}-draft`,
+    status: "Draft - Maker Review Required",
+  });
+  const addCondition = (condition: NonNullable<RuleFunctionDef["conditionSteps"]>[number]) => {
+    markFunctionDraft({ conditionSteps: [...(fn.conditionSteps ?? []), condition] });
+  };
+  const removeCondition = (conditionId:string) => {
+    markFunctionDraft({ conditionSteps: (fn.conditionSteps ?? []).filter(step=>step.id!==conditionId) });
+  };
   const moveRule = (ruleId:string, dir:"up"|"down") => {
     const ids = [...fn.ruleIds]; const i = ids.indexOf(ruleId); if (i<0) return;
     const j = dir==="up"?i-1:i+1; if (j<0||j>=ids.length) return;
     [ids[i],ids[j]]=[ids[j],ids[i]]; setFn({...fn, ruleIds:ids});
+  };
+  const updateRuleFlow = (ruleId:string, patch:NonNullable<RuleFunctionDef["flowOverrides"]>[string], weight?:number|null) => {
+    const nextWeights = {...(fn.weights ?? {})};
+    if (weight !== undefined) {
+      if (weight === null) delete nextWeights[ruleId];
+      else nextWeights[ruleId] = Math.max(0, Math.min(100, Math.round(weight * 100) / 100));
+    }
+    markFunctionDraft({
+      weights: Object.keys(nextWeights).length ? nextWeights : undefined,
+      flowOverrides: {
+        ...(fn.flowOverrides ?? {}),
+        [ruleId]: patch,
+      },
+    });
   };
 
   const passCount = testCases.filter(tc=>tc.fnKey===fn.key&&tc.status==="pass").length;
@@ -2197,8 +2938,8 @@ function RuleFunctionView({ fn, setFn, allRules, testCases, onSaveTestCase, onDe
 
       <TabBar tabs={tabs} active={tab} onChange={setTab}/>
 
-      <div className="flex-1 overflow-hidden">
-        {tab==="Rule Flow"     && <FlowBuilderTab fn={fn} allRules={allRules} onAddRule={addRule} onRemoveRule={removeRule} onMoveRule={moveRule}/>}
+      <div className="flex-1 min-h-0 overflow-hidden">
+        {tab==="Rule Flow"     && <FlowBuilderTab fn={fn} allRules={allRules} onAddRule={addRule} onRemoveRule={removeRule} onMoveRule={moveRule} onAddCondition={addCondition} onRemoveCondition={removeCondition} onUpdateRuleFlow={updateRuleFlow}/>}
         {tab==="Decision Tree" && <DecisionTreeView fn={fn} allRules={allRules}/>}
         {tab==="I/O Contract"  && <IOContractTab fn={fn} allRules={allRules}/>}
         {tab==="Test Cases"    && <TestCasesTab fnKey={fn.key} testCases={testCases} onRun={id=>{}} onDelete={onDeleteTestCase}/>}
@@ -2622,14 +3363,20 @@ function DecisionStudio({
   const [ruleSearch,setRuleSearch]= useState("");
   const [testCases, setTestCases] = useState<TestCase[]>(INITIAL_TEST_CASES);
   const [ruleDrafts, setRuleDrafts] = useState<Record<string,string>>({});
+  const [localRules, setLocalRules] = useState<Rule[]>(RULES);
+  const [showNewRule, setShowNewRule] = useState(false);
+  const [newRuleLogic, setNewRuleLogic] = useState("");
+  const [generatedRule, setGeneratedRule] = useState<Rule|null>(null);
   // Local copies of functions (so we can mutate rule lists)
   const [localFns,  setLocalFns]  = useState<RuleFunctionDef[]>(RULE_FUNCTIONS);
 
-  const selRule = RULES.find(r=>r.id===selRuleId);
+  const selRule = localRules.find(r=>r.id===selRuleId);
   const selFn   = localFns.find(f=>f.key===fnKey)??localFns[0];
 
-  const searchTerm = ruleSearch.toLowerCase();
-  const filteredRules = RULES.filter(r=>
+  const trimmedSearch = ruleSearch.trim();
+  const hasStudioSearch = trimmedSearch.length > 0;
+  const searchTerm = trimmedSearch.toLowerCase();
+  const filteredRules = localRules.filter(r=>
     r.name.toLowerCase().includes(searchTerm) ||
     r.id.toLowerCase().includes(searchTerm) ||
     r.type.toLowerCase().includes(searchTerm)
@@ -2641,6 +3388,25 @@ function DecisionStudio({
   );
 
   const updateFn = (fn:RuleFunctionDef) => setLocalFns(prev=>prev.map(f=>f.key===fn.key?fn:f));
+  const openNewRule = () => {
+    setNewRuleLogic("");
+    setGeneratedRule(null);
+    setShowNewRule(true);
+    setStudioNavTab("rules");
+  };
+  const convertNewRule = () => {
+    if (!newRuleLogic.trim()) return;
+    setGeneratedRule(buildRuleFromLogicText(newRuleLogic, localRules.filter(r=>r.id.startsWith("R-AI-")).length + 1));
+  };
+  const addGeneratedRule = () => {
+    if (!generatedRule) return;
+    setLocalRules(prev=>[generatedRule, ...prev]);
+    setRuleDrafts(prev=>({...prev, [generatedRule.id]: newRuleLogic.trim()}));
+    setSelRuleId(generatedRule.id);
+    setView("rule");
+    setStudioNavTab("rules");
+    setShowNewRule(false);
+  };
 
   const openFn = (key:string) => { setFnKey(key); setView("function"); setStudioNavTab("functions"); };
   const openRule = (id:string) => { setSelRuleId(id); setView("rule"); setStudioNavTab("rules"); };
@@ -2663,7 +3429,7 @@ function DecisionStudio({
           <div className="grid grid-cols-2 gap-1 bg-gray-100 rounded p-0.5">
             {[
               { id:"functions", label:"Rule Functions", count:localFns.length },
-              { id:"rules", label:"Rule Library", count:RULES.length },
+              { id:"rules", label:"Rule Library", count:localRules.length },
             ].map(tab=>(
               <button key={tab.id} onClick={()=>setStudioNavTab(tab.id as "functions"|"rules")}
                 className={`px-2 py-1.5 rounded text-[10px] font-semibold transition-colors ${studioNavTab===tab.id?"bg-white text-[#1E3A6B] shadow-sm":"text-gray-500 hover:text-gray-700"}`}>
@@ -2676,16 +3442,70 @@ function DecisionStudio({
         <div className="px-3 py-2 border-b border-gray-100 flex-shrink-0">
           <div className="flex items-center gap-1.5 bg-gray-50 border border-gray-200 rounded px-2.5 py-1.5">
             <Search size={11} className="text-gray-400"/>
-            <input value={ruleSearch} onChange={e=>setRuleSearch(e.target.value)} placeholder={studioNavTab==="functions"?"Search rule functions…":"Search rules…"} className="flex-1 text-[11px] bg-transparent outline-none"/>
+            <input value={ruleSearch} onChange={e=>setRuleSearch(e.target.value)} placeholder="Search functions and rules…" className="flex-1 text-[11px] bg-transparent outline-none"/>
+            {hasStudioSearch && (
+              <button onClick={()=>setRuleSearch("")} className="text-gray-300 hover:text-gray-600" aria-label="Clear search">
+                <X size={11}/>
+              </button>
+            )}
           </div>
         </div>
 
         <div className="flex-1 overflow-y-auto">
-          {studioNavTab==="functions" ? (
+          {hasStudioSearch ? (
+            <div>
+              <div className="px-4 py-2 border-b border-gray-100">
+                <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">Search Results</div>
+                <div className="text-[10px] text-gray-400 mt-0.5">{filteredFns.length + filteredRules.length} matches for "{trimmedSearch}"</div>
+              </div>
+
+              <div>
+                <div className="flex items-center gap-2 px-4 py-2">
+                  <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide flex-1">Rule Functions</span>
+                  <span className="text-[10px] text-gray-400">{filteredFns.length}</span>
+                </div>
+                {filteredFns.map(fn=>(
+                  <button key={fn.key} onClick={()=>openFn(fn.key)}
+                    className={`w-full flex items-start gap-2 px-4 py-2.5 text-left hover:bg-gray-50 transition-colors border-l-2 ${view==="function"&&fnKey===fn.key?"bg-blue-50 border-l-[#1E3A6B]":"border-l-transparent"}`}>
+                    <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 mt-1.5 ${fn.draftRelease?"bg-amber-400":"bg-green-400"}`}/>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[11px] font-medium text-gray-800 leading-tight">{fn.name}</div>
+                      <div className="flex items-center gap-1.5 mt-0.5">
+                        <code className="font-mono text-[9px] text-gray-400">{fn.key}</code>
+                        <span className="text-[9px] text-gray-400">{fn.domain}</span>
+                      </div>
+                    </div>
+                  </button>
+                ))}
+                {filteredFns.length===0 && <div className="px-4 py-3 text-xs text-gray-400">No matching rule functions</div>}
+              </div>
+
+              <div className="border-t border-gray-100">
+                <div className="flex items-center gap-2 px-4 py-2">
+                  <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide flex-1">Rule Library</span>
+                  <span className="text-[10px] text-gray-400">{filteredRules.length}</span>
+                </div>
+                {filteredRules.map(rule=>(
+                  <button key={rule.id} onClick={()=>openRule(rule.id)}
+                    className={`w-full flex items-start gap-2 px-4 py-2 text-left hover:bg-gray-50 transition-colors border-l-2 ${view==="rule"&&selRuleId===rule.id?"bg-blue-50 border-l-[#1E3A6B]":"border-l-transparent"}`}>
+                    <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 mt-1.5 ${rule.modified?"bg-amber-400":"bg-gray-300"}`}/>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[11px] font-medium text-gray-800 leading-tight truncate">{rule.name}</div>
+                      <div className="flex items-center gap-1.5 mt-0.5">
+                        <code className="font-mono text-[9px] text-gray-400">{rule.id}</code>
+                        <span className="text-[9px] text-gray-400">{rule.type}</span>
+                      </div>
+                    </div>
+                  </button>
+                ))}
+                {filteredRules.length===0 && <div className="px-4 py-3 text-xs text-gray-400">No matching rules</div>}
+              </div>
+            </div>
+          ) : studioNavTab==="functions" ? (
             <div>
               <div className="flex items-center gap-2 px-4 py-2">
                 <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide flex-1">Rule Functions</span>
-                <button onClick={()=>{}} className="text-gray-300 hover:text-[#1E3A6B]"><Plus size={11}/></button>
+                <button onClick={openNewRule} className="text-gray-300 hover:text-[#1E3A6B]" title="Add New Rule"><Plus size={11}/></button>
               </div>
               {filteredFns.map(fn=>(
                 <button key={fn.key} onClick={()=>openFn(fn.key)}
@@ -2710,7 +3530,7 @@ function DecisionStudio({
             <div>
               <div className="flex items-center gap-2 px-4 py-2">
                 <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide flex-1">Rule Library</span>
-                <button onClick={()=>{}} className="text-gray-300 hover:text-[#1E3A6B]"><Plus size={11}/></button>
+                <button onClick={openNewRule} className="text-gray-300 hover:text-[#1E3A6B]" title="Add New Rule"><Plus size={11}/></button>
               </div>
               {filteredRules.map(rule=>(
                 <button key={rule.id} onClick={()=>openRule(rule.id)}
@@ -2723,6 +3543,9 @@ function DecisionStudio({
                 </button>
               ))}
               {filteredRules.length===0 && <div className="px-4 py-8 text-center text-xs text-gray-400">No rules found</div>}
+              <button onClick={openNewRule} className="w-full flex items-center gap-2 px-4 py-2 text-[11px] text-[#1E3A6B] hover:bg-blue-50 transition-colors">
+                <Sparkles size={11}/><span className="font-medium">Add New Rule with AI</span>
+              </button>
             </div>
           )}
         </div>
@@ -2748,10 +3571,70 @@ function DecisionStudio({
           />
         )}
         {view==="function"&&selFn&&(
-          <RuleFunctionView fn={selFn} setFn={updateFn} allRules={RULES}
+          <RuleFunctionView fn={selFn} setFn={updateFn} allRules={localRules}
             testCases={testCases} onSaveTestCase={handleSaveTestCase} onDeleteTestCase={handleDeleteTestCase} go={go} onAskAssistant={onAskFunctionAssistant}/>
         )}
       </div>
+      {showNewRule&&(
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{backgroundColor:"rgba(13,27,62,0.5)"}}>
+          <div className="bg-white rounded-lg shadow-2xl w-[760px] max-h-[84vh] flex flex-col">
+            <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
+              <div>
+                <div className="text-sm font-semibold text-gray-900">Add New Rule with AI</div>
+                <div className="text-xs text-gray-500 mt-0.5">Paste business logic text. AI converts it into structured JSON for maker review.</div>
+              </div>
+              <button onClick={()=>setShowNewRule(false)} className="text-gray-400 hover:text-gray-600"><X size={16}/></button>
+            </div>
+            <div className="flex-1 overflow-auto p-5 space-y-4">
+              <GovernanceBanner text="AI can create a maker-owned draft rule only. Checker approval and release are still required before activation."/>
+              <div>
+                <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Rule Logic Text</label>
+                <textarea
+                  value={newRuleLogic}
+                  onChange={e=>{ setNewRuleLogic(e.target.value); setGeneratedRule(null); }}
+                  rows={7}
+                  placeholder="Example: Rule Name: High Risk Product Block. If productRiskRating > cipRiskTolerance then blocked = true and reasonCode = RISK-MISMATCH. Otherwise blocked = false."
+                  className="w-full border border-gray-200 rounded px-3 py-2 text-xs leading-relaxed resize-y outline-none focus:border-[#1E3A6B]"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <button onClick={convertNewRule} disabled={!newRuleLogic.trim()} className="flex items-center gap-1.5 px-3 py-1.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059] disabled:opacity-40">
+                  <Wand2 size={12}/>Convert to AI Structured JSON
+                </button>
+                {generatedRule && (
+                  <span className="text-xs text-green-700 flex items-center gap-1.5"><CheckCircle2 size={12}/>Structured JSON generated for {generatedRule.id}</span>
+                )}
+              </div>
+              {generatedRule && (
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="border border-gray-200 rounded overflow-hidden">
+                    <div className="px-3 py-2 bg-gray-50 border-b border-gray-200 text-xs font-semibold text-gray-700">Generated Rule Summary</div>
+                    <div className="p-3 space-y-2 text-xs">
+                      <div><span className="text-gray-500">Name:</span> <span className="font-semibold text-gray-900">{generatedRule.name}</span></div>
+                      <div className="flex items-center gap-2"><span className="text-gray-500">Type:</span> <RuleTypeBadge type={generatedRule.type}/></div>
+                      <div><span className="text-gray-500">Rule ID:</span> <code className="font-mono text-[#1E3A6B]">{generatedRule.id}</code></div>
+                      <div><span className="text-gray-500">Inputs:</span> <span className="text-gray-700">{generatedRule.inputs.map(i=>i.name).join(", ")}</span></div>
+                      <div><span className="text-gray-500">Outputs:</span> <span className="text-gray-700">{generatedRule.outputs.map(o=>o.name).join(", ")}</span></div>
+                    </div>
+                  </div>
+                  <div className="border border-gray-200 rounded overflow-hidden">
+                    <div className="px-3 py-2 bg-slate-900 text-slate-100 text-xs font-semibold flex items-center gap-2"><Code2 size={12}/>AI Structured JSON Preview</div>
+                    <pre className="max-h-[260px] overflow-auto bg-slate-950 text-slate-100 p-3 text-[10px] leading-relaxed font-mono">
+                      {JSON.stringify(buildAiStructuredRuleSpec(generatedRule, newRuleLogic), null, 2)}
+                    </pre>
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="px-5 py-3 border-t border-gray-200 flex items-center justify-end gap-2">
+              <button onClick={()=>setShowNewRule(false)} className="px-3 py-1.5 border border-gray-200 rounded text-xs font-medium text-gray-600 hover:bg-gray-50">Cancel</button>
+              <button onClick={addGeneratedRule} disabled={!generatedRule} className="px-3 py-1.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059] disabled:opacity-40 flex items-center gap-1.5">
+                <Plus size={12}/>Add to Rule Library
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2940,7 +3823,13 @@ function CheckerReview({ go }:{ go:(s:Screen)=>void }) {
 
 function ReleaseCenter({ go }:{ go:(s:Screen)=>void }) {
   const [env,setEnv]=useState("Production");
-  const releasesByEnv:Record<string,Array<{name:string;ver:string;status:string;activation:string;maker:string;checker:string;sel:boolean}>>={
+  type ReleaseCandidate = {name:string;ver:string;status:string;activation:string;maker:string;checker:string;sel:boolean;effectiveDate?:string;effectiveTime?:string;releaseMode?:"Immediate"|"Effective Date";scheduledBy?:string;scheduledAt?:string};
+  const [showEffectiveDate,setShowEffectiveDate]=useState(false);
+  const [effectiveDate,setEffectiveDate]=useState("2026-06-22");
+  const [effectiveTime,setEffectiveTime]=useState("09:00");
+  const [scheduleNote,setScheduleNote]=useState("");
+  const [releaseMessage,setReleaseMessage]=useState<string|null>(null);
+  const [releasesByEnv,setReleasesByEnv]=useState<Record<string,Array<ReleaseCandidate>>>({
     Development:[
       {name:"Portfolio Strength Rating",ver:"v4.9-dev",status:"Pending Checker Approval",activation:"Immediate after approval",maker:"Jennifer Wong",checker:"David Lim",sel:true},
       {name:"Investment Idea Suitability",ver:"v3.0-dev",status:"Active",activation:"18 Jun 2026 11:15 SGT",maker:"Amir Tan",checker:"Sarah Chen",sel:false},
@@ -2953,8 +3842,9 @@ function ReleaseCenter({ go }:{ go:(s:Screen)=>void }) {
       {name:"Portfolio Strength Rating",ver:"v4.8",status:"Approved - Awaiting Scheduled Activation",activation:"16 Jun 2026 02:00 SGT",maker:"Jennifer Wong",checker:"David Lim",sel:true},
       {name:"Investment Idea Suitability",ver:"v2.9",status:"Active",activation:"08 Jun 2026 01:30 SGT",maker:"Amir Tan",checker:"Sarah Chen",sel:false},
     ],
-  };
+  });
   const releases=releasesByEnv[env];
+  const selectedRelease=releases.find(r=>r.sel)??releases[0];
   const envCopy:Record<string,string>={
     Development:"Separate development instance. Maker-checker approval can activate immediately or on an effective date.",
     UAT:"Separate UAT instance. Releases are approved and activated here independently; there is no direct UAT-to-Production deployment.",
@@ -2967,6 +3857,54 @@ function ReleaseCenter({ go }:{ go:(s:Screen)=>void }) {
     "Effective Date Set",
     "Active",
   ];
+  const lifecycleIndex = selectedRelease.status==="Active" ? 4 : selectedRelease.status.includes("Effective") || selectedRelease.status.includes("Scheduled") ? 3 : selectedRelease.status.includes("Approved") ? 2 : selectedRelease.status.includes("Checker") ? 1 : 0;
+  const selectRelease = (idx:number) => {
+    setReleaseMessage(null);
+    setReleasesByEnv(prev=>({
+      ...prev,
+      [env]: prev[env].map((r,i)=>({...r, sel:i===idx})),
+    }));
+  };
+  const openEffectiveDate = () => {
+    if (selectedRelease.effectiveDate) setEffectiveDate(selectedRelease.effectiveDate);
+    if (selectedRelease.effectiveTime) setEffectiveTime(selectedRelease.effectiveTime);
+    setScheduleNote("");
+    setReleaseMessage(null);
+    setShowEffectiveDate(true);
+  };
+  const applyEffectiveDate = () => {
+    if (!effectiveDate || !effectiveTime) return;
+    const activation = `${effectiveDate} ${effectiveTime} SGT`;
+    setReleasesByEnv(prev=>({
+      ...prev,
+      [env]: prev[env].map(r=>r.sel ? {
+        ...r,
+        status: "Approved - Effective Date Set",
+        activation,
+        effectiveDate,
+        effectiveTime,
+        releaseMode: "Effective Date",
+        scheduledBy: "Release Operator",
+        scheduledAt: "21 Jun 2026 09:00 SGT",
+      } : r),
+    }));
+    setReleaseMessage(`${selectedRelease.name} ${selectedRelease.ver} scheduled for ${activation} in ${env}.`);
+    setShowEffectiveDate(false);
+  };
+  const releaseImmediately = () => {
+    setReleasesByEnv(prev=>({
+      ...prev,
+      [env]: prev[env].map(r=>r.sel ? {
+        ...r,
+        status: "Active",
+        activation: "Immediate activation completed",
+        releaseMode: "Immediate",
+        scheduledBy: "Release Operator",
+        scheduledAt: "21 Jun 2026 09:00 SGT",
+      } : r),
+    }));
+    setReleaseMessage(`${selectedRelease.name} ${selectedRelease.ver} released immediately in ${env}.`);
+  };
   return (
     <div className="flex flex-col h-full bg-[#F1F4F8]">
       <div className="bg-white border-b border-gray-200 px-6 py-4">
@@ -2976,17 +3914,22 @@ function ReleaseCenter({ go }:{ go:(s:Screen)=>void }) {
             <div className="flex items-center gap-0.5 bg-gray-100 rounded p-0.5">
               {["Development","UAT","Production"].map(e=><button key={e} onClick={()=>setEnv(e)} className={`px-3 py-1 rounded text-xs font-medium transition-colors ${env===e?"bg-white shadow-sm text-gray-900":"text-gray-500 hover:text-gray-700"}`}>{e}</button>)}
             </div>
-            <Btn icon={Rocket} label="Set Effective Date" primary/>
+            <Btn icon={Clock} label="Set Effective Date" primary onClick={openEffectiveDate}/>
           </div>
         </div>
         <GovernanceBanner text="Each environment has its own maker-checker release lane. UAT approval does not deploy to Production; Production requires its own maker and checker approval evidence."/>
+        {releaseMessage && (
+          <div className="mt-3 flex items-center gap-2 bg-green-50 border border-green-200 text-green-700 rounded px-3 py-2 text-xs">
+            <CheckCircle2 size={12}/>{releaseMessage}
+          </div>
+        )}
       </div>
       <div className="bg-white border-b border-gray-200 overflow-auto" style={{maxHeight:"160px"}}>
         <table className="w-full text-xs min-w-[700px]">
           <thead className="bg-gray-50 sticky top-0"><tr>{["Decision","Version","Status","Environment","Activation","Maker","Checker",""].map(h=><th key={h} className="px-3 py-2 text-left font-medium text-gray-500 border-b border-gray-200 whitespace-nowrap">{h}</th>)}</tr></thead>
           <tbody className="divide-y divide-gray-100">
             {releases.map((r,i)=>(
-              <tr key={i} className={`cursor-pointer ${r.sel?"bg-blue-50":"hover:bg-gray-50"}`}>
+              <tr key={i} onClick={()=>selectRelease(i)} className={`cursor-pointer ${r.sel?"bg-blue-50":"hover:bg-gray-50"}`}>
                 <td className="px-3 py-2.5 font-medium text-[#1E3A6B]">{r.name}</td>
                 <td className="px-3 py-2.5 font-mono">{r.ver}</td>
                 <td className="px-3 py-2.5"><StatusBadge status={r.status} size="xs"/></td>
@@ -3002,19 +3945,19 @@ function ReleaseCenter({ go }:{ go:(s:Screen)=>void }) {
         <div className="grid grid-cols-3 gap-4">
           <div className="col-span-2 bg-white border border-gray-200 rounded p-4">
             <div className="flex items-center justify-between mb-4">
-              <div><div className="text-sm font-semibold text-gray-900">Portfolio Strength Rating</div><code className="font-mono text-xs text-gray-500">PS · {env} release lane</code></div>
-              <div className="flex items-center gap-2"><code className="font-mono text-base font-bold text-amber-700">v4.8</code><StatusBadge status="Approved - Awaiting Scheduled Activation" size="xs"/></div>
+              <div><div className="text-sm font-semibold text-gray-900">{selectedRelease.name}</div><code className="font-mono text-xs text-gray-500">{selectedRelease.name.includes("Portfolio")?"PS":"II"} · {env} release lane</code></div>
+              <div className="flex items-center gap-2"><code className="font-mono text-base font-bold text-amber-700">{selectedRelease.ver}</code><StatusBadge status={selectedRelease.status} size="xs"/></div>
             </div>
             <div className="flex gap-0 mb-5">
               {lifecycle.map((stage,i)=>(
                 <div key={stage} className="flex-1 flex flex-col items-center">
-                  <div className={`w-full h-1.5 ${i===0?"rounded-l":""} ${i===lifecycle.length-1?"rounded-r":""} ${i<=3?"bg-[#1E3A6B]":"bg-gray-200"}`}/>
-                  <div className={`text-[9px] mt-1.5 font-medium text-center ${i===3?"text-[#1E3A6B]":i<3?"text-gray-400":"text-gray-300"}`}>{stage}</div>
+                  <div className={`w-full h-1.5 ${i===0?"rounded-l":""} ${i===lifecycle.length-1?"rounded-r":""} ${i<=lifecycleIndex?"bg-[#1E3A6B]":"bg-gray-200"}`}/>
+                  <div className={`text-[9px] mt-1.5 font-medium text-center ${i===lifecycleIndex?"text-[#1E3A6B]":i<lifecycleIndex?"text-gray-400":"text-gray-300"}`}>{stage}</div>
                 </div>
               ))}
             </div>
             <div className="grid grid-cols-2 gap-x-8 gap-y-3 text-xs">
-              {[["Artifact Checksum","sha256:a4b2c1..."],["Maker","Jennifer Wong"],["Checker","David Lim · Advisory Compliance"],["Environment",env],["Activation Option","Immediate or effective date"],["Rollback Target",env==="Production"?"v4.7 (currently active)":"previous active in same instance"]].map(([k,v])=>(
+              {[["Artifact Checksum","sha256:a4b2c1..."],["Maker",selectedRelease.maker],["Checker",`${selectedRelease.checker} · Advisory Compliance`],["Environment",env],["Activation",selectedRelease.activation],["Activation Option",selectedRelease.releaseMode ?? "Immediate or effective date"],["Rollback Target",env==="Production"?"v4.7 (currently active)":"previous active in same instance"],["Scheduled By",selectedRelease.scheduledBy ?? "Not scheduled"]].map(([k,v])=>(
                 <div key={k}><div className="text-gray-500">{k}</div><div className={`font-medium text-gray-900 mt-0.5 ${k==="Artifact Checksum"?"font-mono text-[10px] text-gray-600":""}`}>{v}</div></div>
               ))}
             </div>
@@ -3023,8 +3966,8 @@ function ReleaseCenter({ go }:{ go:(s:Screen)=>void }) {
             <div className="bg-white border border-gray-200 rounded p-4">
               <div className="text-sm font-semibold text-gray-900 mb-3">Release Actions</div>
               <div className="space-y-2">
-                <button className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059]"><Rocket size={12}/>Release Immediately</button>
-                <button className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50"><Clock size={12}/>Set Effective Date</button>
+                <button onClick={releaseImmediately} className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059]"><Rocket size={12}/>Release Immediately</button>
+                <button onClick={openEffectiveDate} className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50"><Clock size={12}/>Set Effective Date</button>
                 <button className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50"><Eye size={12}/>Preview Release Notes</button>
                 <button className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50"><History size={12}/>Rollback Same Instance</button>
                 <button onClick={()=>go("trace")} className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50"><Eye size={12}/>View Decision Trace</button>
@@ -3034,6 +3977,48 @@ function ReleaseCenter({ go }:{ go:(s:Screen)=>void }) {
           </div>
         </div>
       </div>
+      {showEffectiveDate&&(
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{backgroundColor:"rgba(13,27,62,0.5)"}}>
+          <div className="bg-white rounded-lg shadow-2xl w-[520px] max-h-[80vh] flex flex-col">
+            <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
+              <div>
+                <div className="text-sm font-semibold text-gray-900">Set Effective Date</div>
+                <div className="text-xs text-gray-500 mt-0.5">{selectedRelease.name} · {selectedRelease.ver} · {env}</div>
+              </div>
+              <button onClick={()=>setShowEffectiveDate(false)} className="text-gray-400 hover:text-gray-600"><X size={16}/></button>
+            </div>
+            <div className="p-5 space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Effective Date</label>
+                  <input type="date" value={effectiveDate} onChange={e=>setEffectiveDate(e.target.value)}
+                    className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B]"/>
+                </div>
+                <div>
+                  <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Effective Time</label>
+                  <input type="time" value={effectiveTime} onChange={e=>setEffectiveTime(e.target.value)}
+                    className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B]"/>
+                </div>
+              </div>
+              <div className="bg-blue-50 border border-blue-200 rounded p-3 text-xs text-blue-800">
+                Activation will be scheduled only in the selected {env} instance. This does not deploy from UAT to Production.
+              </div>
+              <div>
+                <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Release Operator Note</label>
+                <textarea value={scheduleNote} onChange={e=>setScheduleNote(e.target.value)} rows={3}
+                  placeholder="Optional schedule rationale or change ticket reference"
+                  className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B] resize-none"/>
+              </div>
+            </div>
+            <div className="px-5 py-3 border-t border-gray-200 flex items-center justify-end gap-2">
+              <button onClick={()=>setShowEffectiveDate(false)} className="px-3 py-1.5 border border-gray-200 rounded text-xs font-medium text-gray-600 hover:bg-gray-50">Cancel</button>
+              <button onClick={applyEffectiveDate} disabled={!effectiveDate||!effectiveTime} className="px-3 py-1.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059] disabled:opacity-40 flex items-center gap-1.5">
+                <Clock size={12}/>Set Effective Date
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1221,7 +1221,106 @@ public class StandardRuleExecutionEngine {
 }
 ```
 
-### 12.4 Standard Condition Evaluator
+### 12.4 Rule Function Execution Engine
+
+Individual rule JSON is executed by `StandardRuleExecutionEngine`. Rule functions use a higher-level structured JSON artifact that tells Java how to orchestrate multiple rules.
+
+Supported function execution types:
+
+| Execution type | Java handler | Purpose |
+| --- | --- | --- |
+| `PARALLEL_RULE_FLOW` | `RuleFunctionExecutionEngine.executeRuleFlow` | Runs multiple rule families independently, then applies an aggregation node such as `WeightedAggregation`. |
+| `DECISION_TREE` | `RuleFunctionExecutionEngine.executeDecisionTree` | Evaluates configured condition nodes with `onTrue`, `onFalse`, named `flowId`, warning, terminal, and next-node branches. |
+
+Example function execution envelope:
+
+```json
+{
+  "schemaVersion": "1.0",
+  "functionKey": "II",
+  "functionName": "Investment Idea Suitability and Recommendation",
+  "executionType": "DECISION_TREE",
+  "javaHandler": "RuleFunctionExecutionEngine.executeDecisionTree",
+  "rootNodeId": "NODE-R-PRESTR-001",
+  "flows": [
+    {
+      "flowId": "RESTRICTION_BLOCK_FLOW",
+      "type": "TERMINAL",
+      "terminal": "NOT_RECOMMENDED"
+    },
+    {
+      "flowId": "HARD_ELIGIBILITY_FLOW",
+      "type": "CONTINUE",
+      "startsAt": "NODE-R-HELIG-001"
+    }
+  ],
+  "nodes": [
+    {
+      "nodeId": "NODE-R-PRESTR-001",
+      "ruleId": "R-PRESTR-001",
+      "condition": {
+        "field": "restrictedFlags",
+        "operator": "contains",
+        "value": "PRODUCT_BLOCKED"
+      },
+      "onTrue": {
+        "flowId": "RESTRICTION_BLOCK_FLOW",
+        "terminal": "NOT_RECOMMENDED",
+        "reasonCode": "IDEA-RESTRICTED"
+      },
+      "onFalse": {
+        "flowId": "HARD_ELIGIBILITY_FLOW",
+        "nextNodeId": "NODE-R-HELIG-001"
+      }
+    }
+  ],
+  "governance": {
+    "requiresMakerReview": true,
+    "requiresCheckerApproval": true,
+    "executableBy": "JAVA_BACKEND_ONLY"
+  }
+}
+```
+
+Pseudocode:
+
+```java
+public RuleFunctionExecutionResult executeDecisionTree(
+    RuleFunctionSpec functionSpec,
+    Map<String, Object> inputPayload
+) {
+    validator.validate(functionSpec);
+
+    RuleFunctionContext context = new RuleFunctionContext(inputPayload);
+    FunctionNode current = functionSpec.node(functionSpec.rootNodeId());
+
+    while (current != null) {
+        RuleExecutionResult ruleResult = standardRuleExecutionEngine.execute(
+            ruleRepository.loadStructuredJson(current.ruleId()),
+            context.inputPayload(),
+            context.priorRuleResults()
+        );
+        context.record(ruleResult);
+
+        boolean matched = conditionEvaluator.matches(current.condition(), context.combinedFacts());
+        NodeTransition transition = matched ? current.onTrue() : current.onFalse();
+        context.enterFlow(transition.flowId());
+
+        if (transition.warning() != null) {
+            context.addWarning(transition.warning());
+        }
+        if (transition.terminal() != null) {
+            return resultBuilder.terminal(functionSpec, transition, context);
+        }
+
+        current = functionSpec.node(transition.nextNodeId());
+    }
+
+    return resultBuilder.completed(functionSpec, context);
+}
+```
+
+### 12.5 Standard Condition Evaluator
 
 The condition evaluator is shared by `ScoringMatrix`, `ThresholdMatrix`, `DecisionTable`, `ExclusionList`, and `RankingMatrix`. It evaluates JSON condition nodes using an allowlist of operators.
 
@@ -1257,7 +1356,7 @@ public class ConditionEvaluator {
 }
 ```
 
-### 12.5 Standard Output Resolver
+### 12.6 Standard Output Resolver
 
 Output assignment is also generic. A rule evaluator returns the `set` block from the matched JSON row, and the resolver turns it into output values.
 
@@ -1289,7 +1388,7 @@ public class OutputResolver {
 }
 ```
 
-### 12.6 Example: Same Java Code, Different Business Scenarios
+### 12.7 Example: Same Java Code, Different Business Scenarios
 
 The same `ScoringMatrixEvaluator` can execute Cash, Income Return, Growth Return, ESG, or SAA Number rules because the differences are stored in JSON.
 
@@ -1333,7 +1432,7 @@ ESG example using the same evaluator:
 
 No Java code changes are needed between these two examples.
 
-### 12.7 When Java Code Changes Are Required
+### 12.8 When Java Code Changes Are Required
 
 | Change | Java Code Change Required? | Reason |
 | --- | --- | --- |
@@ -1452,6 +1551,9 @@ No Java code changes are needed between these two examples.
   - `ExclusionList`
   - `LookupTable`
   - `WeightedAggregation`
+- Implement `RuleFunctionExecutionEngine.executeRuleFlow` for parallel rule-flow orchestration and aggregation.
+- Implement `RuleFunctionExecutionEngine.executeDecisionTree` for condition-based node traversal and terminal outcomes.
+- Validate function execution JSON before running any child rule.
 - Return output and trace.
 
 ### Phase 4: Historical Regression And Review

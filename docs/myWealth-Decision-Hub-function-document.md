@@ -196,6 +196,8 @@ Functions:
 
 - Provides a rule library and rule function library.
 - Uses a Decision Studio sub-navigation tab bar with `Rule Functions` first and `Rule Library` second.
+- Provides cross-studio search across rule functions and rules, grouped by result type.
+- Supports `Add New Rule with AI`: maker pastes rule logic text, AI infers rule type, inputs, outputs, and generates AI Structured JSON before adding the draft rule to the local Rule Library.
 - Opens individual rule editor views.
 - Opens full rule function workspaces.
 - Allows local in-memory changes to rule function composition:
@@ -216,8 +218,8 @@ Rule function workspace tabs:
 
 | Tab | Function |
 | --- | --- |
-| Rule Flow | Shows parallel Portfolio Strength flow or sequential Investment Idea flow. |
-| Decision Tree | Visualizes function execution as a decision tree. |
+| Rule Flow | Shows parallel Portfolio Strength flow or condition-based Investment Idea decision-tree flow, supports adding rules and function-level conditions, supports editing flow-step weights, condition labels, branch flow IDs, branch outcomes, and maker notes, and exposes backend Java execution JSON. |
+| Decision Tree | Visualizes condition results as explicit TRUE/FALSE branches that can continue to different downstream flows or terminal outcomes, and exposes the same backend Java execution JSON. |
 | I/O Contract | Auto-derives function inputs and outputs from member rules. |
 | Test Cases | Lists saved regression, boundary, historical, prior-incident, and checker sample cases; supports running individual cases and regression runs. |
 | Simulation | Runs an ad hoc case from input values, displays rule execution trace, and can save the result as a test case for future historical/regression runs. |
@@ -230,6 +232,16 @@ Testing functions:
 - Treat historical cases as saved test cases with expected outputs and trace evidence.
 - Save ad hoc simulation output as a reusable test case.
 - Use test case pass/fail evidence in maker submission and checker review.
+- Add Rule Flow conditions from the flow view; condition nodes include expression text, TRUE/FALSE flow IDs, branch outcomes, and maker notes.
+- Edit Rule Flow steps from the flow view; edits create/update a maker-review draft and are reflected in the backend execution JSON metadata.
+
+Backend execution model shown in the UI:
+
+- Rule functions generate a structured execution JSON artifact.
+- Portfolio Strength uses `executionType = PARALLEL_RULE_FLOW` and is handled by `RuleFunctionExecutionEngine.executeRuleFlow`.
+- Investment Idea uses `executionType = DECISION_TREE` and is handled by `RuleFunctionExecutionEngine.executeDecisionTree`.
+- Decision-tree nodes use condition results to choose `onTrue` or `onFalse` transitions, including named `flowId` routing, next-node routing, warning flow, exception flow, or terminal outcome.
+- Java backend execution uses the structured JSON only; the visual flow and decision tree are review surfaces for the same executable artifact.
 
 ### 7.2 AI Works
 
@@ -283,6 +295,7 @@ Functions:
   - Checker
 - Shows release lifecycle: Draft, Maker Submitted, Checker Approved, Effective Date Set, Active.
 - Provides actions for release immediately, setting an effective date, previewing release notes, same-instance rollback, and viewing decision trace.
+- `Set Effective Date` opens a scheduling dialog for the selected release candidate, captures date, time, and release-operator note, updates activation timing, and moves the candidate to `Approved - Effective Date Set`.
 
 Governance constraint:
 
