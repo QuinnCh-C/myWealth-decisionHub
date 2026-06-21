@@ -10,23 +10,23 @@ The application is implemented as a Vite React single-page app. Most product beh
 
 ## 2. Product Scope
 
-The prototype supports three first-class business areas:
+The prototype supports two first-class business decision areas, with testing evidence embedded in Decision Studio:
 
 | Area | Purpose | Current implementation status |
 | --- | --- | --- |
-| Portfolio Strength | Calculates a 1-5 portfolio strength rating from weighted rule families. | Detailed rule function, rules, test cases, simulation, review, release, and trace samples are implemented. |
-| Investment Idea | Determines investment idea suitability and recommendation rank. | Rule function, sequential decision flow, simulation, and test cases are implemented. |
-| Simulation | Compares draft and active rule versions across portfolio cohorts and regression scenarios. | Simulation Lab view is implemented with static impact metrics and charts. |
+| Portfolio Strength | Calculates a 1-5 portfolio strength rating from weighted rule families. | Detailed rule function, rules, test cases, ad hoc run, review, release, and trace samples are implemented. |
+| Investment Idea | Determines investment idea suitability and recommendation rank. | Rule function, sequential decision flow, ad hoc run, and test cases are implemented. |
+| Testing Evidence | Runs draft rule versions against saved test cases, historical cases, boundary cases, prior-incident cases, and checker samples. | Test and historical case runs are embedded in Decision Studio instead of a separate testing module. |
 
 ## 3. User Roles
 
 | Role | Function in the application |
 | --- | --- |
-| Maker | Creates and edits rule functions, uses AI assistance, validates drafts, runs simulations, and submits reviewed drafts. The sample maker is Jennifer Wong. |
-| Checker | Reviews submitted drafts, examines rule diffs, test evidence, simulation impact, and approves or rejects changes. The sample checker is David Lim. |
-| Administrator | Manages environments, release scheduling, activation, rollback, and platform settings. |
+| Maker | Creates and edits rule functions, uses AI assistance, validates drafts, runs test cases or ad hoc cases, and submits reviewed drafts. The sample maker is Jennifer Wong. |
+| Checker | Reviews submitted drafts, examines rule diffs, test evidence, run impact, and approves or rejects changes. The sample checker is David Lim. |
+| Administrator | Manages separate Development, UAT, and Production instances, release scheduling, activation, rollback, and platform settings. |
 | Auditor | Reviews traceability, rule versions, approval evidence, execution history, and masked runtime outcomes. |
-| Advisor operations user | Consumes portfolio ratings, investment idea recommendations, simulation results, and decision traces. |
+| Advisor operations user | Consumes portfolio ratings, investment idea recommendations, test evidence, and decision traces. |
 
 ## 4. Core Navigation
 
@@ -34,15 +34,13 @@ The left navigation exposes these modules:
 
 | Module | Function |
 | --- | --- |
-| Decision Catalog | Dashboard for governed decisions, active versions, draft statuses, metrics, and user tasks. |
 | Decision Studio | Main authoring workspace for rules and rule functions. |
 | AI Works | AI-assisted draft generation workspace. |
-| Simulation Lab | Draft-versus-active impact analysis for Portfolio Strength. |
 | My Drafts | Draft work queue placeholder. |
 | Review Queue | Checker review workbench. |
-| Release Center | Approved release scheduling, activation governance, and rollback entry point. |
+| Release Center | Per-environment maker-checker release control with immediate or effective-date activation. |
 | Decision Trace | Runtime decision explanation and audit trace. |
-| Platform Settings | Settings placeholder. |
+| Platform Settings | Environment, access, maker-checker, AI, regression, release, audit, and reference-data settings. |
 
 ## 5. Domain Model
 
@@ -192,21 +190,12 @@ Current mock logic:
 
 ## 7. Key Screens and Functions
 
-### 7.1 Decision Catalog
-
-Functions:
-
-- Shows enterprise metrics: active decisions, portfolio rule families, maker drafts, checker approvals, simulation runs, and validation issues.
-- Lists decision assets such as Portfolio Strength Rating, Investment Idea Suitability, and Portfolio Impact Simulation Policy.
-- Displays active release, draft status, owner, and modified date.
-- Provides task shortcuts for draft review, simulation inspection, and validation evidence.
-- Routes users into Decision Studio or Simulation Lab.
-
-### 7.2 Decision Studio
+### 7.1 Decision Studio
 
 Functions:
 
 - Provides a rule library and rule function library.
+- Uses a Decision Studio sub-navigation tab bar with `Rule Functions` first and `Rule Library` second.
 - Opens individual rule editor views.
 - Opens full rule function workspaces.
 - Allows local in-memory changes to rule function composition:
@@ -214,6 +203,8 @@ Functions:
   - Remove rule.
   - Move rule up or down.
 - Maintains local test cases in React state during the session.
+- Is the default first screen of the simplified prototype.
+- Contains test case execution, historical regression case execution, and ad hoc simulation evidence inside the rule function workspace.
 
 Rule editor functions:
 
@@ -228,11 +219,19 @@ Rule function workspace tabs:
 | Rule Flow | Shows parallel Portfolio Strength flow or sequential Investment Idea flow. |
 | Decision Tree | Visualizes function execution as a decision tree. |
 | I/O Contract | Auto-derives function inputs and outputs from member rules. |
-| Test Cases | Lists saved regression and boundary test cases. |
-| Simulation | Runs mock function simulation and displays rule execution trace. |
-| Change History | Placeholder. |
+| Test Cases | Lists saved regression, boundary, historical, prior-incident, and checker sample cases; supports running individual cases and regression runs. |
+| Simulation | Runs an ad hoc case from input values, displays rule execution trace, and can save the result as a test case for future historical/regression runs. |
+| Change History | Shows function version history, changed rule families, maker/checker events, evidence snapshot, and release context. |
 
-### 7.3 AI Works
+Testing functions:
+
+- Run a saved test case from the Test Cases tab.
+- Run a regression suite from the Test Cases tab.
+- Treat historical cases as saved test cases with expected outputs and trace evidence.
+- Save ad hoc simulation output as a reusable test case.
+- Use test case pass/fail evidence in maker submission and checker review.
+
+### 7.2 AI Works
 
 Functions:
 
@@ -248,33 +247,16 @@ Governance constraints shown in the UI:
 - Production rules remain unchanged.
 - Drafts require maker review and checker approval.
 
-### 7.4 Simulation Lab
-
-Functions:
-
-- Compares Portfolio Strength draft `v4.8` against active `v4.7`.
-- Shows validation status, regression scenarios, boundary scenarios, changed outcomes, and warnings.
-- Presents portfolio cohort impact metrics:
-  - Total: 18,240
-  - Unchanged: 17,887
-  - Stronger: 41
-  - Weaker: 312
-  - Advisor Review: 41
-  - Exceptions: 0
-- Charts rating distribution and primary change drivers.
-- Identifies SAA Allocation and House View as main change drivers.
-- Routes maker toward submission workflow.
-
-### 7.5 Maker Submission
+### 7.3 Maker Submission
 
 Functions:
 
 - Summarizes the draft being submitted.
-- Shows proposed changes, AI action record, validation evidence, regression evidence, and simulation evidence.
+- Shows proposed changes, AI action record, validation evidence, regression evidence, and ad hoc run evidence.
 - Requires maker attestations before submission.
 - Routes completed submissions to the checker review queue.
 
-### 7.6 Checker Review
+### 7.4 Checker Review
 
 Functions:
 
@@ -285,29 +267,32 @@ Functions:
 - Supports request changes, reject, and approve for release actions.
 - Approval creates an approved release candidate, not a deployment.
 
-### 7.7 Release Center
+### 7.5 Release Center
 
 Functions:
 
-- Shows release candidates and deployed versions across environments.
-- Supports environment selection between Development, UAT, and Production.
+- Shows release candidates and active versions within the selected environment instance.
+- Supports environment selection between separate Development, UAT, and Production instances.
 - Displays approved release candidate metadata:
   - Decision
   - Version
   - Status
   - Environment
   - Activation time
-  - Approver
-  - Source
-- Shows release lifecycle: Draft, Pending Approval, Approved, Scheduled, Active, Retired.
-- Provides actions for scheduling activation, previewing release notes, rollback, and viewing decision trace.
+  - Maker
+  - Checker
+- Shows release lifecycle: Draft, Maker Submitted, Checker Approved, Effective Date Set, Active.
+- Provides actions for release immediately, setting an effective date, previewing release notes, same-instance rollback, and viewing decision trace.
 
 Governance constraint:
 
-- myWealth Decision Assistant cannot activate or deploy decisions.
-- Release actions require authorized operational users and approved evidence.
+- myWealth Decision Assistant cannot activate or release decisions.
+- Development, UAT, and Production each follow maker -> checker -> release.
+- Production release can activate immediately after checker approval or activate on an effective date supplied by the authorized release user.
+- UAT approval does not deploy to Production directly; Production requires its own release action and approval evidence.
+- Rollback applies only within the selected environment instance.
 
-### 7.8 Decision Trace
+### 7.6 Decision Trace
 
 Functions:
 
@@ -317,6 +302,19 @@ Functions:
 - Lists rule-family results, rating, weight, state, reason code, and note.
 - Shows skipped rules such as Tenor with skip reason.
 - Provides final weighted score and rating explanation.
+
+### 7.7 Platform Settings
+
+Functions:
+
+- Configures separate Development, UAT, and Production environment instances.
+- Manages user access, maker, checker, and release-operator roles.
+- Defines maker-checker policy by decision tier and environment.
+- Configures AI workspace controls, including backend AI conversion and disabled AI approval/release capabilities.
+- Manages the regression test library, boundary suites, prior-incident suites, and expected-result re-baseline approvals.
+- Defines release governance for immediate release, effective-date release, and same-instance rollback.
+- Configures audit retention, trace masking defaults, and exportable evidence packs.
+- Maintains reference data controls such as CIP bands, house view mappings, reason-code registry, and rule contract registry.
 
 ## 8. Test Case Coverage
 
@@ -348,7 +346,8 @@ The prototype repeatedly enforces these principles in screen copy and workflow s
 - AI cannot approve, activate, or deploy decisions.
 - Maker review is required before checker review.
 - Checker approval is required before release.
-- Release activation is a separate operational action.
+- Release activation is an environment-specific maker-checker action.
+- UAT approval does not directly deploy or promote to Production.
 - Runtime traces should identify decision version, rule outputs, reason codes, reference data, approval evidence, and execution trace.
 - Sensitive client inputs are masked by default.
 
@@ -360,7 +359,7 @@ The prototype repeatedly enforces these principles in screen copy and workflow s
 | Entry point | `src/main.tsx` renders `src/app/App.tsx`. |
 | Styling | CSS files under `src/styles`, with Tailwind-style utility classes in JSX. |
 | Icons | `lucide-react`. |
-| Charts | `recharts`. |
+| Charts | None exposed in the simplified prototype. |
 | UI primitives | Local components under `src/app/components/ui`, though most app UI is implemented directly in `App.tsx`. |
 | Data source | In-memory constants in `App.tsx`. |
 | Persistence | None. State resets on page reload. |
@@ -370,22 +369,22 @@ The prototype repeatedly enforces these principles in screen copy and workflow s
 
 - No backend service or database is connected.
 - Rule definitions and rule functions are static constants.
-- Simulation engine is a mock implementation, not a production rule engine.
+- Test/ad hoc run engine is a mock implementation, not a production rule engine.
 - Add, remove, move rule operations are local to React state.
 - Test case creation is local to React state.
 - Search and filters are mostly visual; some rule search is functional.
 - AI Works timeline is simulated with timers and static draft content.
 - Review, approval, release, and deployment actions are screen transitions only.
-- Platform Settings, My Drafts, and parts of Change History are placeholders.
+- My Drafts remains a placeholder.
+- Platform Settings now shows the expected configuration areas, but configuration actions remain prototype-only.
 
 ## 12. Recommended Next Enhancements
 
-1. Split `App.tsx` into domain data, simulation services, screen components, and shared UI components.
+1. Split `App.tsx` into domain data, test execution services, screen components, and shared UI components.
 2. Define persistent rule/function schemas and store them in an API-backed repository.
-3. Replace mock simulation with a deterministic rule execution service.
+3. Replace mock test/ad hoc runs with a deterministic rule execution service.
 4. Add real maker-checker workflow state, comments, approval evidence, and immutable audit log.
 5. Add test execution assertions that compare actual outputs to expected outputs.
 6. Implement real search, filters, environment selection, role permissions, and release authorization.
 7. Add exportable evidence packs for checker review and audit.
 8. Add automated UI and rule-engine tests for Portfolio Strength and Investment Idea flows.
-

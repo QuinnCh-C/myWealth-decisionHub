@@ -3,22 +3,18 @@ import {
   Search, Bell, ChevronDown, Sparkles, PenLine,
   FlaskConical, FolderOpen, ClipboardCheck, Rocket,
   Settings, CheckCircle2, Clock, AlertTriangle,
-  Download, Play, GitCompare, History, Eye, MessageSquare,
+  Play, GitCompare, History, Eye, MessageSquare,
   Shield, Check, X, FileText, AlertCircle, Info, Lock,
-  ChevronRight, MoreHorizontal, Bot, Send, Home, Database,
+  ChevronRight, MoreHorizontal, Bot, Send, Database,
   Plus, Layers, Code2, ArrowDown, Trash2, Edit3,
   Hash, Type, List, ToggleLeft, Package, ChevronUp,
   RefreshCw, Save, TestTube, Zap, ArrowRight, Copy,
   GitBranch, Wand2, CornerDownRight, Minus
 } from "lucide-react";
-import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, Legend
-} from "recharts";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Screen = "catalog"|"studio"|"ai-works"|"simulation"|"drafts"|"review-queue"|"release"|"trace"|"settings"|"maker-submit";
+type Screen = "studio"|"ai-works"|"drafts"|"review-queue"|"release"|"trace"|"settings"|"maker-submit";
 type StudioView = "rule"|"function"|"none";
 
 interface IOField {
@@ -69,6 +65,20 @@ interface SimResult {
   weightedScore: number;
   finalRating: number|null;
   finalOutput: Record<string, string>;
+}
+
+interface ValidationCheck {
+  label: string;
+  detail: string;
+  severity: "pass"|"warning"|"error";
+}
+
+interface AssistantContext {
+  source: "rule"|"function";
+  ruleId: string;
+  ruleName: string;
+  ruleType: string;
+  prompt: string;
 }
 
 // ─── Individual Rules data ────────────────────────────────────────────────────
@@ -360,13 +370,178 @@ function RuleTypeBadge({ type }:{ type:string }) {
   return <span className={`text-[10px] px-1.5 py-px rounded font-medium border ${ruleTypeCls[type]??"bg-gray-50 text-gray-600 border-gray-200"}`}>{type}</span>;
 }
 
+function getRuleLogicDraftText(rule: Rule) {
+  if (rule.type === "ThresholdMatrix") {
+    return [
+      `${rule.name} (${rule.id})`,
+      `Type: ${rule.type}`,
+      "",
+      "Draft logic notes:",
+      "- Evaluate the submitted input value against CIP-specific threshold bands.",
+      "- Return the configured rating, reason code and supporting measured value.",
+      rule.modified ? "- Draft v4.8 highlights changed threshold bands for maker review." : "- No draft threshold change is currently flagged.",
+      "",
+      "Outputs:",
+      ...rule.outputs.map(o => `- ${o.name}: ${o.desc}`),
+    ].join("\n");
+  }
+
+  if (rule.type === "DecisionTable") {
+    return [
+      `${rule.name} (${rule.id})`,
+      `Type: ${rule.type}`,
+      "",
+      "Draft logic notes:",
+      "- Evaluate rows in order using the configured conditions.",
+      "- Stop at the first blocking or warning outcome when the table requires it.",
+      "- Return the mapped decision output and reason code for traceability.",
+      "",
+      "Outputs:",
+      ...rule.outputs.map(o => `- ${o.name}: ${o.desc}`),
+    ].join("\n");
+  }
+
+  if (rule.type === "WeightedAggregation") {
+    const fn = RULE_FUNCTIONS.find(f => f.ruleIds.includes(rule.id));
+    const weights = fn?.weights ?? {};
+    return [
+      `${rule.name} (${rule.id})`,
+      `Type: ${rule.type}`,
+      "",
+      "Draft logic notes:",
+      "- Aggregate computed rule ratings using configured weights.",
+      "- Exclude skipped rules and renormalise active weights to 100%.",
+      "- Apply ceiling to the weighted score to produce the final portfolio-strength rating.",
+      "",
+      "Current weights:",
+      ...Object.entries(weights).map(([ruleId, weight]) => {
+        const weightedRule = RULES.find(r => r.id === ruleId);
+        return `- ${weightedRule?.shortName ?? ruleId}: ${weight}%`;
+      }),
+    ].join("\n");
+  }
+
+  const logicText: Record<string, string> = {
+    ScoringMatrix: "Input value -> band lookup -> rating. Bands may vary by CIP tier where applicable.",
+    ExclusionList: "Evaluate exclusion conditions in order. The first match determines the output.",
+    LookupTable: "Perform a key-value lookup against a reference table and return the mapped output value.",
+    RankingMatrix: "Evaluate ranking conditions in order and return the first matching recommendation rank.",
+  };
+
+  return [
+    `${rule.name} (${rule.id})`,
+    `Type: ${rule.type}`,
+    "",
+    "Draft logic notes:",
+    `- ${logicText[rule.type] ?? "Configurable rule logic."}`,
+    "- Preserve input and output contract compatibility unless a draft explicitly changes it.",
+    "",
+    "Outputs:",
+    ...rule.outputs.map(o => `- ${o.name}: ${o.desc}`),
+  ].join("\n");
+}
+
+function buildRuleQuickTestOutput(rule: Rule, inputs: Record<string, string>) {
+  const num = (key: string, fallback: number) => {
+    const parsed = parseFloat(inputs[key] ?? "");
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  const text = (key: string, fallback: string) => inputs[key] || fallback;
+  const ratingCode = (prefix: string, rating: number) => `${prefix}-00${rating}`;
+
+  switch (rule.id) {
+    case "R-CIP-001": {
+      const cip = text("cip", "Moderate");
+      const risk = num("portfolioRisk", 3.2);
+      const target = cip === "Conservative" ? 2 : cip === "Aggressive" ? 4 : 3;
+      const rating = Math.min(5, Math.max(1, Math.round(Math.abs(risk - target)) + 2));
+      return { cipRating: String(rating), cipReasonCode: ratingCode("PS-CIP", rating) };
+    }
+    case "R-CASH-001": {
+      const cash = num("cashRatio", 12.4);
+      const rating = cash <= 5 ? 1 : cash <= 10 ? 2 : cash <= 20 ? 3 : cash <= 30 ? 4 : 5;
+      return { cashRating: String(rating), cashReasonCode: ratingCode("PS-CASH", rating) };
+    }
+    case "R-INCOME-001": {
+      const income = num("incomeReturn", 3.2);
+      const rating = income >= 5 ? 1 : income >= 3.5 ? 2 : income >= 2 ? 3 : income >= 1 ? 4 : 5;
+      return { incomeRating: String(rating), incomeReasonCode: ratingCode("PS-INCOME", rating) };
+    }
+    case "R-GROWTH-001": {
+      const growth = num("growthReturn", 5.1);
+      const rating = growth >= 8 ? 1 : growth >= 5 ? 2 : growth >= 3 ? 3 : growth >= 1 ? 4 : 5;
+      return { growthRating: String(rating), growthReasonCode: ratingCode("PS-GROWTH", rating) };
+    }
+    case "R-TENOR-001": {
+      const tenor = inputs.tenor;
+      if (!tenor || tenor === "null") return { tenorRating: "null", tenorSkip: "PS-TENOR-SKIP-001" };
+      return { tenorRating: "3", tenorSkip: "" };
+    }
+    case "R-SAANUM-001": {
+      const saaNumber = num("saaNumber", 7);
+      const rating = saaNumber >= 9 ? 1 : saaNumber >= 7 ? 2 : saaNumber >= 5 ? 3 : saaNumber >= 3 ? 4 : 5;
+      return { saaNumRating: String(rating), saaNumReasonCode: ratingCode("PS-SAANUM", rating) };
+    }
+    case "R-SAAALLOC-001": {
+      const cip = text("cip", "Moderate");
+      const gap = Math.abs(num("saaAllocationGap", 14.2));
+      const threshold = cip === "Conservative" ? 8 : cip === "Aggressive" ? 18 : 12;
+      const rating = gap <= 2 ? 1 : gap <= 5 ? 2 : gap <= threshold * 0.65 ? 3 : gap <= threshold ? 4 : 5;
+      return { saaAllocRating: String(rating), saaAllocGap: gap.toFixed(1), saaAllocReasonCode: ratingCode("PS-SAA-GAP", rating) };
+    }
+    case "R-HV-001": {
+      const deviation = Math.abs(num("houseViewAlignment", -9.1));
+      const rating = deviation <= 2 ? 1 : deviation <= 4 ? 2 : deviation <= 8 ? 3 : deviation <= 10 ? 4 : 5;
+      return { hvRating: String(rating), hvReasonCode: ratingCode("PS-HV-UW", rating) };
+    }
+    case "R-THEME-001":
+      return { thematicRating: "3", thematicReasonCode: "PS-THEME-003" };
+    case "R-ESG-001": {
+      const esg = num("esgScore", 68);
+      const rating = esg >= 80 ? 1 : esg >= 60 ? 2 : esg >= 40 ? 3 : esg >= 20 ? 4 : 5;
+      return { esgRating: String(rating), esgReasonCode: ratingCode("PS-ESG", rating) };
+    }
+    case "R-NTW-001":
+      return { exceptionApplied: "false", exceptionReasonCode: "" };
+    case "R-OVERALL-001":
+      return { overallRating: "4", weightedScore: "3.72", activeWeight: "100%" };
+    case "R-PRESTR-001": {
+      const restricted = text("restrictedFlags", "[]") !== "[]";
+      return { restricted: String(restricted), restrictionCode: restricted ? "IDEA-RESTRICTED" : "" };
+    }
+    case "R-HELIG-001": {
+      const productRisk = num("productRiskRating", 3);
+      const eligible = productRisk <= 4;
+      return { eligible: String(eligible), eligReasonCode: eligible ? "IDEA-CIP-OK" : "IDEA-CIP-BLOCK" };
+    }
+    case "R-SSUIT-001": {
+      const concentration = num("holdingConcentration", 22);
+      const hasWarning = concentration > 25;
+      return { suitabilityWarnings: hasWarning ? "[IDEA-CONCENTRATION-WARN]" : "[]", suitReasonCode: hasWarning ? "IDEA-SUIT-003" : "IDEA-SUIT-OK" };
+    }
+    case "R-HVII-001": {
+      const houseView = text("houseView", "OW");
+      const adjustment = houseView === "OW" ? "+1" : houseView === "UW" ? "-1" : "0";
+      return { hvAdjustment: adjustment, hvReasonCode: houseView === "OW" ? "IDEA-HOUSEVIEW-OW" : houseView === "UW" ? "IDEA-HOUSEVIEW-UW" : "IDEA-HOUSEVIEW-N" };
+    }
+    case "R-RANK-001": {
+      const houseView = text("houseView", "OW");
+      const rank = houseView === "OW" ? 2 : houseView === "UW" ? 4 : 3;
+      return { recommendationRank: String(rank), advisorMessage: rank <= 2 ? "Suitable with house-view support" : "Suitable with advisory review", rankReasonCode: `IDEA-RANK-${rank}` };
+    }
+    default:
+      return rule.outputs.reduce<Record<string, string>>((out, field) => {
+        out[field.name] = field.sample;
+        return out;
+      }, {});
+  }
+}
+
 // ─── Left Navigation ──────────────────────────────────────────────────────────
 
 const NAV_ITEMS = [
-  { id:"catalog",      label:"Decision Catalog",   icon:Home,          badge:null as string|null, badgeCls:"" },
   { id:"studio",       label:"Decision Studio",    icon:Layers,        badge:null,                badgeCls:"" },
   { id:"ai-works",     label:"AI Works",           icon:Wand2,         badge:null,                badgeCls:"" },
-  { id:"simulation",   label:"Simulation Lab",     icon:FlaskConical,  badge:null,                badgeCls:"" },
   { id:"drafts",       label:"My Drafts",          icon:FolderOpen,    badge:"4",                 badgeCls:"bg-amber-500" },
   { id:"review-queue", label:"Review Queue",       icon:ClipboardCheck,badge:"12",                badgeCls:"bg-blue-600" },
   { id:"release",      label:"Release Center",     icon:Rocket,        badge:null,                badgeCls:"" },
@@ -417,15 +592,54 @@ function LeftNav({ current, go, studioFn, setStudioFn }:{ current:Screen; go:(s:
   );
 }
 
+const ENVIRONMENT_OPTIONS = [
+  { name:"Development", dot:"bg-amber-400", desc:"Isolated authoring and local draft testing" },
+  { name:"UAT", dot:"bg-blue-500", desc:"User acceptance testing with separate approval evidence" },
+  { name:"Production", dot:"bg-green-500", desc:"Live release lane with maker-checker controls" },
+] as const;
+
+type EnvironmentName = typeof ENVIRONMENT_OPTIONS[number]["name"];
+
 function TopBar() {
+  const [envOpen, setEnvOpen] = useState(false);
+  const [environment, setEnvironment] = useState<EnvironmentName>("Development");
+  const selectedEnv = ENVIRONMENT_OPTIONS.find(e=>e.name===environment) ?? ENVIRONMENT_OPTIONS[0];
+
   return (
     <div className="h-11 bg-white border-b border-gray-200 flex items-center px-4 gap-3 flex-shrink-0">
       <div className="flex items-center gap-2 flex-1 max-w-sm bg-gray-50 border border-gray-200 rounded px-3 py-1.5">
         <Search size={12} className="text-gray-400"/>
         <input className="flex-1 text-xs bg-transparent outline-none placeholder-gray-400" placeholder="Search rules, functions, decisions…"/>
       </div>
-      <div className="flex items-center gap-1.5 px-3 py-1.5 border border-gray-200 rounded text-xs text-gray-700 cursor-pointer select-none hover:bg-gray-50">
-        <div className="w-1.5 h-1.5 rounded-full bg-amber-400"/><span>Development</span><ChevronDown size={11} className="text-gray-400"/>
+      <div className="relative">
+        <button
+          onClick={()=>setEnvOpen(open=>!open)}
+          className="flex items-center gap-1.5 px-3 py-1.5 border border-gray-200 rounded text-xs text-gray-700 cursor-pointer select-none hover:bg-gray-50"
+          aria-haspopup="menu"
+          aria-expanded={envOpen}
+        >
+          <div className={`w-1.5 h-1.5 rounded-full ${selectedEnv.dot}`}/>
+          <span>{selectedEnv.name}</span>
+          <ChevronDown size={11} className={`text-gray-400 transition-transform ${envOpen?"rotate-180":""}`}/>
+        </button>
+        {envOpen && (
+          <div className="absolute right-0 top-full mt-1 w-64 bg-white border border-gray-200 rounded shadow-lg z-50 py-1">
+            {ENVIRONMENT_OPTIONS.map(env=>(
+              <button
+                key={env.name}
+                onClick={()=>{setEnvironment(env.name);setEnvOpen(false);}}
+                className={`w-full text-left px-3 py-2 hover:bg-gray-50 ${environment===env.name?"bg-blue-50/60":""}`}
+              >
+                <div className="flex items-center gap-2">
+                  <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${env.dot}`}/>
+                  <span className="text-xs font-medium text-gray-900">{env.name}</span>
+                  {environment===env.name && <Check size={11} className="ml-auto text-[#1E3A6B]"/>}
+                </div>
+                <div className="text-[10px] text-gray-500 mt-0.5 ml-3.5 leading-snug">{env.desc}</div>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
       <div className="flex items-center gap-2 ml-auto">
         <button className="relative p-1.5 rounded hover:bg-gray-100 text-gray-500"><Bell size={15}/><span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 bg-red-500 rounded-full"/></button>
@@ -560,17 +774,240 @@ function RuleLogicDisplay({ rule }: { rule: Rule }) {
   );
 }
 
+function buildAiStructuredRuleSpec(rule: Rule, sourceText: string) {
+  const parsedSample = (value: string) => {
+    if (value === "true") return true;
+    if (value === "false") return false;
+    const n = Number(value);
+    return Number.isFinite(n) && value.trim() !== "" ? n : value;
+  };
+
+  const firstOutput = rule.outputs[0]?.name ?? "result";
+  const reasonOutput = rule.outputs.find(o=>o.name.toLowerCase().includes("reason"))?.name;
+  const reasonCode = rule.outputs.find(o=>o.name.toLowerCase().includes("reason"))?.sample ?? `${rule.id}-REASON`;
+  const common = {
+    schemaVersion: "1.0",
+    ruleId: rule.id,
+    ruleType: rule.type,
+    name: rule.name,
+    description: rule.desc,
+    inputContract: rule.inputs.map(({ name, type, required, desc })=>({ name, type, required, description: desc })),
+    outputContract: rule.outputs.map(({ name, type, required, desc })=>({ name, type, required, description: desc })),
+    metadata: {
+      generatedBy: "AI",
+      source: sourceText ? "maker_logic_text" : "current_rule_asset",
+      requiresMakerReview: true,
+      promptVersion: "prototype-rule-compiler-v1",
+    },
+  };
+
+  if (rule.type === "ThresholdMatrix") {
+    return {
+      ...common,
+      logic: {
+        groupBy: rule.inputs[0]?.name ?? "segment",
+        valueField: rule.inputs[1]?.name ?? "value",
+        absoluteValue: true,
+        groups: [
+          {
+            groupValue: "Moderate",
+            thresholds: [
+              { id:`${rule.id}-BAND-001`, operator:"<=", value:2, set:{ [firstOutput]:1, ...(reasonOutput ? { [reasonOutput]:reasonCode.replace(/\d+$/, "001") } : {}) }, trace:"Moderate threshold band 1" },
+              { id:`${rule.id}-BAND-002`, operator:"<=", value:5, set:{ [firstOutput]:2, ...(reasonOutput ? { [reasonOutput]:reasonCode.replace(/\d+$/, "002") } : {}) }, trace:"Moderate threshold band 2" },
+              { id:`${rule.id}-BAND-003`, operator:"<=", value:8, set:{ [firstOutput]:3, ...(reasonOutput ? { [reasonOutput]:reasonCode.replace(/\d+$/, "003") } : {}) }, trace:"Moderate threshold band 3" },
+              { id:`${rule.id}-BAND-004`, operator:"<=", value:12, set:{ [firstOutput]:4, ...(reasonOutput ? { [reasonOutput]:reasonCode.replace(/\d+$/, "004") } : {}) }, trace:"Moderate threshold band 4" },
+            ],
+            default: { set:{ [firstOutput]:5, ...(reasonOutput ? { [reasonOutput]:reasonCode.replace(/\d+$/, "005") } : {}) }, trace:"Value exceeds configured threshold" },
+          },
+        ],
+      },
+    };
+  }
+
+  if (rule.type === "DecisionTable") {
+    return {
+      ...common,
+      logic: {
+        evaluation: "firstMatch",
+        rows: [
+          {
+            id: `${rule.id}-ROW-001`,
+            when: { field: rule.inputs[0]?.name ?? "input", operator:"isNotNull" },
+            set: Object.fromEntries(rule.outputs.map(o=>[o.name, parsedSample(o.sample)])),
+            trace: "First governed decision row generated from maker logic text",
+          },
+        ],
+        default: {
+          set: Object.fromEntries(rule.outputs.map(o=>[o.name, parsedSample(o.sample)])),
+          trace: "Default outcome preserves current rule behavior",
+        },
+      },
+    };
+  }
+
+  if (rule.type === "WeightedAggregation") {
+    const fn = RULE_FUNCTIONS.find(f=>f.ruleIds.includes(rule.id));
+    const weights = fn?.weights ?? {};
+    return {
+      ...common,
+      logic: {
+        ratingField: "rating",
+        skipStatuses: ["SKIPPED"],
+        rounding: "ceiling",
+        weights: Object.entries(weights).map(([ruleId, weight])=>({ ruleId, weight })),
+        set: {
+          overallRating: "$computed.ceilingWeightedScore",
+          weightedScore: "$computed.weightedScore",
+          activeWeight: "$computed.activeWeight",
+        },
+        trace: "Weighted score calculated from computed rule ratings; skipped rules excluded",
+      },
+    };
+  }
+
+  if (rule.type === "ExclusionList") {
+    return {
+      ...common,
+      logic: {
+        evaluation: "firstMatch",
+        exclusions: [
+          {
+            id: `${rule.id}-EXCLUSION-001`,
+            when: { field: rule.inputs[0]?.name ?? "flags", operator:"contains", value:"BLOCKED" },
+            set: Object.fromEntries(rule.outputs.map(o=>[o.name, parsedSample(o.sample)])),
+            trace: "Exclusion condition generated from maker logic text",
+          },
+        ],
+        default: {
+          set: Object.fromEntries(rule.outputs.map(o=>[o.name, o.type === "boolean" ? false : ""])),
+          trace: "No exclusion matched",
+        },
+      },
+    };
+  }
+
+  if (rule.type === "LookupTable") {
+    return {
+      ...common,
+      logic: {
+        keyField: rule.inputs[0]?.name ?? "key",
+        entries: [
+          { key:"OW", set:Object.fromEntries(rule.outputs.map(o=>[o.name, parsedSample(o.sample)])), trace:"Lookup entry generated from current reference data" },
+        ],
+        default: {
+          set: Object.fromEntries(rule.outputs.map(o=>[o.name, parsedSample(o.sample)])),
+          trace: "Default lookup outcome",
+        },
+      },
+    };
+  }
+
+  return {
+    ...common,
+    logic: {
+      evaluation: "firstMatch",
+      bands: [
+        {
+          id: `${rule.id}-BAND-001`,
+          when: { field: rule.inputs[0]?.name ?? "input", operator:"isNotNull" },
+          set: Object.fromEntries(rule.outputs.map(o=>[o.name, parsedSample(o.sample)])),
+          trace: "Generated band preserves current sample output behavior",
+        },
+      ],
+      default: {
+        set: Object.fromEntries(rule.outputs.map(o=>[o.name, parsedSample(o.sample)])),
+        trace: "Default outcome generated by AI conversion",
+      },
+    },
+  };
+}
+
+function RuleLogicTabs({ rule, savedDraft, defaultDraft }: { rule: Rule; savedDraft?: string; defaultDraft: string }) {
+  const tabs = savedDraft
+    ? ["Business Logic","AI Structured JSON","Validation","Local Draft"]
+    : ["Business Logic","AI Structured JSON","Validation"];
+  const [active, setActive] = useState(tabs[0]);
+  const sourceText = savedDraft ?? defaultDraft;
+  const structuredJson = JSON.stringify(buildAiStructuredRuleSpec(rule, sourceText), null, 2);
+  const checks = [
+    { label:"Schema", detail:"ruleLogicSpec envelope uses schemaVersion 1.0.", ok:true },
+    { label:"Contracts", detail:`${rule.inputs.length} inputs and ${rule.outputs.length} outputs are declared.`, ok:true },
+    { label:"Execution safety", detail:"Structured JSON contains data-only conditions and assignments.", ok:true },
+    { label:"Maker review", detail:"AI conversion requires maker review before checker submission.", ok:true },
+    { label:"Warnings", detail:rule.modified ? "Draft threshold changes require focused review." : "No conversion warnings in prototype sample.", ok:!rule.modified },
+  ];
+
+  useEffect(() => {
+    setActive(tabs[0]);
+  }, [rule.id, Boolean(savedDraft)]);
+
+  return (
+    <div className="bg-white border border-gray-200 rounded overflow-hidden">
+      <div className="px-4 py-3 border-b border-gray-200 flex items-start justify-between">
+        <div>
+          <div className="text-sm font-semibold text-gray-900">Rule Logic</div>
+          <div className="text-xs text-gray-500 mt-0.5">Business-readable logic and AI-converted structured JSON for maker review.</div>
+        </div>
+        <StatusBadge status="AI-Assisted" size="xs"/>
+      </div>
+      <div className="flex border-b border-gray-200 bg-gray-50 overflow-x-auto">
+        {tabs.map(tab=>(
+          <button key={tab} onClick={()=>setActive(tab)}
+            className={`px-4 py-2 text-xs font-medium border-b-2 whitespace-nowrap ${active===tab?"border-[#1E3A6B] text-[#1E3A6B] bg-white":"border-transparent text-gray-500 hover:text-gray-700"}`}>
+            {tab}
+          </button>
+        ))}
+      </div>
+      <div className="p-4">
+        {active==="Business Logic" && <RuleLogicDisplay rule={rule}/>}
+        {active==="AI Structured JSON" && (
+          <div>
+            <div className="flex items-center gap-2 mb-2">
+              <Code2 size={12} className="text-[#1E3A6B]"/>
+              <span className="text-xs font-semibold text-gray-900">AI-converted ruleLogicSpec JSON</span>
+              <span className="ml-auto text-[10px] text-amber-600 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5">Maker review required</span>
+            </div>
+            <pre className="max-h-[420px] overflow-auto bg-slate-950 text-slate-100 rounded p-3 text-[11px] leading-relaxed font-mono">{structuredJson}</pre>
+          </div>
+        )}
+        {active==="Validation" && (
+          <div className="space-y-2">
+            {checks.map(check=>(
+              <div key={check.label} className={`flex items-start gap-2 border rounded px-3 py-2 ${check.ok?"bg-green-50 border-green-200":"bg-amber-50 border-amber-200"}`}>
+                {check.ok ? <CheckCircle2 size={12} className="text-green-700 flex-shrink-0 mt-0.5"/> : <AlertCircle size={12} className="text-amber-700 flex-shrink-0 mt-0.5"/>}
+                <div className="text-xs"><span className={`font-semibold ${check.ok?"text-green-800":"text-amber-800"}`}>{check.label}</span><span className="text-gray-700"> · {check.detail}</span></div>
+              </div>
+            ))}
+          </div>
+        )}
+        {active==="Local Draft" && savedDraft && (
+          <div className="border border-green-200 bg-green-50/50 rounded overflow-hidden">
+            <div className="px-3 py-2 border-b border-green-200 flex items-center gap-2 bg-green-50">
+              <CheckCircle2 size={12} className="text-green-700"/>
+              <span className="text-xs font-semibold text-green-900">Local Draft Logic</span>
+              <span className="ml-auto text-[10px] text-green-700 font-medium">Draft saved locally</span>
+            </div>
+            <pre className="p-3 text-xs text-gray-700 whitespace-pre-wrap font-mono leading-relaxed">{savedDraft}</pre>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Rule Quick-Test Panel ────────────────────────────────────────────────────
 
 function RuleQuickTest({ rule }: { rule: Rule }) {
   const [vals, setVals] = useState<Record<string,string>>({});
   const [result, setResult] = useState<Record<string,string>|null>(null);
 
+  useEffect(() => {
+    setVals({});
+    setResult(null);
+  }, [rule.id]);
+
   const handleRun = () => {
-    // Mock single-rule test
-    const mockOut: Record<string,string> = {};
-    rule.outputs.forEach(o => { mockOut[o.name] = o.sample; });
-    setResult(mockOut);
+    setResult(buildRuleQuickTestOutput(rule, vals));
   };
 
   return (
@@ -596,9 +1033,11 @@ function RuleQuickTest({ rule }: { rule: Rule }) {
             <Play size={11}/>Run Rule
           </button>
           {result && (
-            <div className="flex-1 flex items-center gap-3">
+            <div className="flex-1 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2">
               {Object.entries(result).map(([k,v])=>(
-                <div key={k} className="text-xs"><span className="text-gray-500">{k}:</span> <span className="font-mono font-semibold text-[#1E3A6B]">{v}</span></div>
+                <div key={k} className="text-xs bg-blue-50/60 border border-blue-100 rounded px-2 py-1">
+                  <span className="text-gray-500">{k}:</span> <span className="font-mono font-semibold text-[#1E3A6B]">{v || "—"}</span>
+                </div>
               ))}
             </div>
           )}
@@ -610,7 +1049,91 @@ function RuleQuickTest({ rule }: { rule: Rule }) {
 
 // ─── Rule Editor View ─────────────────────────────────────────────────────────
 
-function RuleEditorView({ rule }: { rule: Rule }) {
+function RuleLogicDraftEditor({
+  rule, value, isDirty, onChange, onSave, onCancel,
+}: {
+  rule: Rule;
+  value: string;
+  isDirty: boolean;
+  onChange: (value: string) => void;
+  onSave: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="border border-amber-200 bg-amber-50/40 rounded overflow-hidden">
+      <div className="px-3 py-2 border-b border-amber-200 flex items-center gap-2 bg-amber-50">
+        <PenLine size={12} className="text-amber-700"/>
+        <span className="text-xs font-semibold text-amber-900">Editable Logic Draft</span>
+        <span className="ml-auto text-[10px] font-medium text-amber-700">
+          {isDirty ? "Unsaved draft" : "Ready to save"}
+        </span>
+      </div>
+      <div className="p-3">
+        <div className="grid grid-cols-3 gap-2 mb-3 text-[10px]">
+          <div className="bg-white border border-amber-100 rounded px-2 py-1">
+            <span className="text-gray-400">Rule</span>
+            <div className="font-mono font-semibold text-gray-800 mt-0.5">{rule.id}</div>
+          </div>
+          <div className="bg-white border border-amber-100 rounded px-2 py-1">
+            <span className="text-gray-400">Type</span>
+            <div className="font-semibold text-gray-800 mt-0.5">{rule.type}</div>
+          </div>
+          <div className="bg-white border border-amber-100 rounded px-2 py-1">
+            <span className="text-gray-400">Mode</span>
+            <div className="font-semibold text-gray-800 mt-0.5">Prototype local draft</div>
+          </div>
+        </div>
+        <textarea
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          rows={10}
+          className="w-full border border-amber-200 bg-white rounded px-3 py-2 text-xs font-mono leading-relaxed resize-y focus:outline-none focus:border-[#1E3A6B]"
+        />
+        <div className="flex items-center gap-2 mt-3">
+          <button onClick={onSave} disabled={!value.trim()}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059] disabled:opacity-40">
+            <Save size={11}/>Save Draft
+          </button>
+          <button onClick={onCancel}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-gray-200 text-gray-700 rounded text-xs font-medium hover:bg-gray-50">
+            <X size={11}/>Cancel
+          </button>
+          <span className="text-[10px] text-amber-700 ml-auto">No backend write. This draft stays in the current prototype session.</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RuleEditorView({
+  rule, savedDraft, onSaveDraft, onAskAssistant,
+}: {
+  rule: Rule;
+  savedDraft?: string;
+  onSaveDraft: (ruleId: string, draftText: string) => void;
+  onAskAssistant: (rule: Rule) => void;
+}) {
+  const defaultDraft = getRuleLogicDraftText(rule);
+  const [editing, setEditing] = useState(false);
+  const [draftText, setDraftText] = useState(savedDraft ?? defaultDraft);
+
+  useEffect(() => {
+    setEditing(false);
+    setDraftText(savedDraft ?? getRuleLogicDraftText(rule));
+  }, [rule.id, savedDraft]);
+
+  const baseline = savedDraft ?? defaultDraft;
+  const isDirty = draftText !== baseline;
+  const hasSavedDraft = Boolean(savedDraft);
+  const cancelEdit = () => {
+    setDraftText(baseline);
+    setEditing(false);
+  };
+  const saveDraft = () => {
+    onSaveDraft(rule.id, draftText);
+    setEditing(false);
+  };
+
   return (
     <div className="flex flex-col h-full overflow-y-auto bg-[#F1F4F8]">
       {/* Header */}
@@ -629,8 +1152,8 @@ function RuleEditorView({ rule }: { rule: Rule }) {
             <p className="text-xs text-gray-500 mt-0.5 leading-relaxed max-w-2xl">{rule.desc}</p>
           </div>
           <div className="flex items-center gap-2">
-            <Btn icon={PenLine}  label="Edit Logic"/>
-            <Btn icon={Sparkles} label="Ask Assistant"/>
+            <Btn icon={PenLine}  label={editing ? "Editing Logic" : "Edit Logic"} onClick={()=>setEditing(true)}/>
+            <Btn icon={Sparkles} label="Ask Assistant" onClick={()=>onAskAssistant(rule)}/>
             <Btn icon={Copy}     label="Clone Rule"/>
           </div>
         </div>
@@ -640,6 +1163,10 @@ function RuleEditorView({ rule }: { rule: Rule }) {
           <span>Used by: {rule.usedBy.map(k=>RULE_FUNCTIONS.find(f=>f.key===k)?.name??k).join(", ")||"—"}</span>
           <span>·</span>
           <span className="text-gray-400">Category: {rule.category}</span>
+          <span>·</span>
+          <span className={editing && isDirty ? "text-amber-600 font-medium" : hasSavedDraft ? "text-green-700 font-medium" : "text-gray-400"}>
+            {editing && isDirty ? "Unsaved draft" : hasSavedDraft ? "Draft saved locally" : "No local draft"}
+          </span>
         </div>
       </div>
 
@@ -675,9 +1202,20 @@ function RuleEditorView({ rule }: { rule: Rule }) {
         </div>
 
         {/* Logic */}
-        <div className="bg-white border border-gray-200 rounded p-4">
-          <RuleLogicDisplay rule={rule}/>
-        </div>
+        {editing ? (
+          <div className="bg-white border border-gray-200 rounded p-4">
+            <RuleLogicDraftEditor
+              rule={rule}
+              value={draftText}
+              isDirty={isDirty}
+              onChange={setDraftText}
+              onSave={saveDraft}
+              onCancel={cancelEdit}
+            />
+          </div>
+        ) : (
+          <RuleLogicTabs rule={rule} savedDraft={savedDraft} defaultDraft={defaultDraft}/>
+        )}
 
         {/* Quick Test */}
         <RuleQuickTest rule={rule}/>
@@ -1372,14 +1910,131 @@ function SimulationTab({ fn, allRules, onSaveTestCase }:{
   );
 }
 
+function ChangeHistoryTab({ fn, allRules, testCases }: { fn:RuleFunctionDef; allRules:Rule[]; testCases:TestCase[] }) {
+  const fnRules = fn.ruleIds.map(id=>allRules.find(r=>r.id===id)).filter(Boolean) as Rule[];
+  const modifiedRules = fnRules.filter(r=>r.modified);
+  const fnCases = testCases.filter(tc=>tc.fnKey===fn.key);
+  const passCount = fnCases.filter(tc=>tc.status==="pass").length;
+  const failCount = fnCases.filter(tc=>tc.status==="fail").length;
+  const pendingCount = fnCases.length - passCount - failCount;
+  const latestVersion = fn.draftRelease ?? fn.activeRelease;
+  const history = fn.key === "PS" ? [
+    { version:"v4.8", date:"13 Jun 2026 16:42 SGT", actor:"Jennifer Wong", event:"AI-assisted draft created", status:"Draft - Maker Review Required", summary:"SAA Allocation and House View threshold matrices updated for Moderate CIP portfolios.", evidence:"Validation passed · 118 regression cases · 34 boundary cases" },
+    { version:"v4.7", date:"06 Jun 2026 02:00 SGT", actor:"David Lim", event:"Checker approved production release", status:"Active", summary:"Prior production baseline for Portfolio Strength Rating.", evidence:"Maker attestation · Checker approval · Release notes attached" },
+    { version:"v4.6", date:"17 May 2026 01:30 SGT", actor:"Sarah Chen", event:"Effective-date release completed", status:"Retired", summary:"Tenor skip handling and active-weight renormalisation added.", evidence:"Regression passed · Decision trace samples exported" },
+  ] : [
+    { version:"v2.9", date:"08 Jun 2026 01:30 SGT", actor:"Sarah Chen", event:"Production release completed", status:"Active", summary:"House view ranking adjustment and suitability warning wording refreshed.", evidence:"Regression passed · Checker approval" },
+    { version:"v2.8", date:"22 May 2026 15:10 SGT", actor:"Amir Tan", event:"Checker approved release candidate", status:"Retired", summary:"Jurisdiction eligibility table updated for advisory recommendations.", evidence:"Maker attestation · 42 test cases passed" },
+  ];
+  const changedItems = modifiedRules.length > 0
+    ? modifiedRules.map(rule=>({ rule:rule.name, type:rule.type, change:rule.id==="R-SAAALLOC-001" ? "Moderate CIP threshold bands reduced from 15% to 12%." : "Underweight threshold handling tightened for house-view alignment.", impact:"Requires maker review and checker approval." }))
+    : [{ rule:"No draft rule changes", type:"Baseline", change:"Current active function has no local draft modifications.", impact:"No pending change impact." }];
+
+  return (
+    <div className="flex-1 overflow-y-auto p-4 bg-[#F1F4F8]">
+      <div className="grid grid-cols-4 gap-2.5 mb-4">
+        {[
+          ["Current Version", latestVersion, "text-[#1E3A6B]"],
+          ["History Entries", String(history.length), "text-gray-900"],
+          ["Changed Rules", String(modifiedRules.length), modifiedRules.length ? "text-amber-700" : "text-green-700"],
+          ["Test Evidence", `${passCount} pass · ${failCount} fail · ${pendingCount} pending`, failCount ? "text-red-600" : "text-green-700"],
+        ].map(([label,value,cls])=>(
+          <div key={label} className="bg-white border border-gray-200 rounded p-3">
+            <div className={`text-sm font-bold leading-tight ${cls}`}>{value}</div>
+            <div className="text-[10px] text-gray-500 mt-1">{label}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-3 gap-4">
+        <div className="col-span-2 bg-white border border-gray-200 rounded overflow-hidden">
+          <div className="px-4 py-3 border-b border-gray-200 flex items-center gap-2">
+            <History size={13} className="text-[#1E3A6B]"/>
+            <div>
+              <div className="text-sm font-semibold text-gray-900">Version History</div>
+              <div className="text-xs text-gray-500 mt-0.5">Immutable function-level change records for maker, checker and release review.</div>
+            </div>
+          </div>
+          <div className="divide-y divide-gray-100">
+            {history.map((item,index)=>(
+              <div key={`${item.version}-${item.date}`} className="px-4 py-3 flex gap-3">
+                <div className="flex flex-col items-center">
+                  <div className={`w-7 h-7 rounded-full flex items-center justify-center border ${index===0?"bg-[#1E3A6B] border-[#1E3A6B] text-white":"bg-white border-gray-300 text-gray-500"}`}>
+                    {index===0 ? <GitBranch size={12}/> : <Clock size={12}/>}
+                  </div>
+                  {index<history.length-1 && <div className="w-px flex-1 bg-gray-200 mt-1"/>}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <code className="font-mono text-xs font-bold text-gray-900">{item.version}</code>
+                    <StatusBadge status={item.status} size="xs"/>
+                    <span className="text-xs text-gray-400">{item.date}</span>
+                  </div>
+                  <div className="text-xs font-semibold text-gray-900 mt-1">{item.event}</div>
+                  <p className="text-xs text-gray-600 mt-1 leading-relaxed">{item.summary}</p>
+                  <div className="flex items-center gap-2 mt-2 text-[10px] text-gray-500">
+                    <span>Actor: <strong className="text-gray-700">{item.actor}</strong></span>
+                    <span>·</span>
+                    <span>{item.evidence}</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          <div className="bg-white border border-gray-200 rounded overflow-hidden">
+            <div className="px-4 py-3 border-b border-gray-200">
+              <div className="text-sm font-semibold text-gray-900">Changed Rule Families</div>
+              <div className="text-xs text-gray-500 mt-0.5">Draft-level changes in this function.</div>
+            </div>
+            <div className="divide-y divide-gray-100">
+              {changedItems.map(item=>(
+                <div key={item.rule} className="px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-gray-900">{item.rule}</span>
+                    <RuleTypeBadge type={item.type}/>
+                  </div>
+                  <p className="text-xs text-gray-600 mt-1 leading-relaxed">{item.change}</p>
+                  <div className="text-[10px] text-amber-700 mt-1">{item.impact}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="bg-white border border-gray-200 rounded p-4">
+            <div className="text-sm font-semibold text-gray-900 mb-3">Evidence Snapshot</div>
+            <div className="space-y-2 text-xs">
+              {[
+                ["Maker", fn.draftRelease ? "Jennifer Wong · Pending attestation" : "Last maker evidence retained"],
+                ["Checker", fn.draftRelease ? "David Lim · Not yet approved" : "Approved in active release"],
+                ["Tests", `${passCount}/${fnCases.length || 0} passed`],
+                ["Release", fn.draftRelease ? "Not released" : `${fn.activeRelease} active`],
+              ].map(([label,value])=>(
+                <div key={label} className="flex justify-between gap-3 border-b border-gray-100 last:border-0 pb-2 last:pb-0">
+                  <span className="text-gray-500">{label}</span>
+                  <span className="font-medium text-gray-900 text-right">{value}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Rule Function Workspace ──────────────────────────────────────────────────
 
-function RuleFunctionView({ fn, setFn, allRules, testCases, onSaveTestCase, onDeleteTestCase, go }:{
+function RuleFunctionView({ fn, setFn, allRules, testCases, onSaveTestCase, onDeleteTestCase, go, onAskAssistant }:{
   fn:RuleFunctionDef; setFn:(f:RuleFunctionDef)=>void; allRules:Rule[];
   testCases:TestCase[]; onSaveTestCase:(tc:TestCase)=>void; onDeleteTestCase:(id:string)=>void;
   go:(s:Screen)=>void;
+  onAskAssistant:(fn:RuleFunctionDef)=>void;
 }) {
   const [tab, setTab] = useState("Rule Flow");
+  const [validationChecks, setValidationChecks] = useState<ValidationCheck[]|null>(null);
   const tabs = ["Rule Flow","Decision Tree","I/O Contract","Test Cases","Simulation","Change History"];
 
   const addRule = (ruleId:string) => setFn({...fn, ruleIds:[...fn.ruleIds, ruleId]});
@@ -1393,6 +2048,36 @@ function RuleFunctionView({ fn, setFn, allRules, testCases, onSaveTestCase, onDe
   const passCount = testCases.filter(tc=>tc.fnKey===fn.key&&tc.status==="pass").length;
   const failCount = testCases.filter(tc=>tc.fnKey===fn.key&&tc.status==="fail").length;
   const totalCases = testCases.filter(tc=>tc.fnKey===fn.key).length;
+  const validationErrorCount = validationChecks?.filter(c=>c.severity==="error").length ?? 0;
+  const validationWarningCount = validationChecks?.filter(c=>c.severity==="warning").length ?? 0;
+  const validationPassed = validationChecks !== null && validationErrorCount === 0;
+
+  const handleValidate = () => {
+    const resolvedRules = fn.ruleIds.map(id=>allRules.find(r=>r.id===id)).filter(Boolean) as Rule[];
+    const unresolvedRuleIds = fn.ruleIds.filter(id=>!allRules.some(r=>r.id===id));
+    const inputNames = new Set(resolvedRules.flatMap(r=>r.inputs.map(i=>i.name)));
+    const outputNames = new Set(resolvedRules.flatMap(r=>r.outputs.map(o=>o.name)));
+    const hasAggregation = fn.key !== "PS" || resolvedRules.some(r=>r.type==="WeightedAggregation");
+    const hasRequiredContract = inputNames.size > 0 && outputNames.size > 0;
+    const hasRegressionEvidence = totalCases > 0;
+    const failedCases = failCount;
+
+    setValidationChecks([
+      unresolvedRuleIds.length === 0
+        ? { label:"Rule references", detail:`All ${fn.ruleIds.length} rule references resolve in the library.`, severity:"pass" }
+        : { label:"Rule references", detail:`Missing rule references: ${unresolvedRuleIds.join(", ")}.`, severity:"error" },
+      hasRequiredContract
+        ? { label:"I/O contract", detail:`Derived ${inputNames.size} input fields and ${outputNames.size} output fields from member rules.`, severity:"pass" }
+        : { label:"I/O contract", detail:"Function must expose at least one input and one output field.", severity:"error" },
+      hasAggregation
+        ? { label:"Aggregation", detail:fn.key === "PS" ? "Portfolio Strength includes Overall Weighted Rating aggregation." : "Sequential function does not require weighted aggregation.", severity:"pass" }
+        : { label:"Aggregation", detail:"Portfolio Strength requires an Overall Weighted Rating aggregation rule.", severity:"error" },
+      hasRegressionEvidence
+        ? { label:"Test coverage", detail:`${totalCases} saved test cases available: ${passCount} passed, ${failedCases} failed, ${totalCases - passCount - failedCases} pending.`, severity:failedCases > 0 ? "warning" : "pass" }
+        : { label:"Test coverage", detail:"No saved test cases are available for regression or historical runs.", severity:"warning" },
+      { label:"Release guardrail", detail:"Validation is frontend-only evidence. Maker review and checker approval are still required.", severity:"pass" },
+    ]);
+  };
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -1411,8 +2096,8 @@ function RuleFunctionView({ fn, setFn, allRules, testCases, onSaveTestCase, onDe
             </div>
           </div>
           <div className="flex items-center gap-2 flex-shrink-0 pt-0.5">
-            <Btn icon={Sparkles}     label="Ask Assistant"/>
-            <Btn icon={AlertCircle}  label="Validate"/>
+            <Btn icon={Sparkles}     label="Ask Assistant" onClick={()=>onAskAssistant(fn)}/>
+            <Btn icon={AlertCircle}  label="Validate" onClick={handleValidate}/>
             <Btn icon={FlaskConical} label="Run All Tests" onClick={()=>setTab("Test Cases")}/>
             {fn.draftRelease && <Btn icon={CheckCircle2} label="Submit for Review" primary onClick={()=>go("maker-submit")}/>}
           </div>
@@ -1481,6 +2166,35 @@ function RuleFunctionView({ fn, setFn, allRules, testCases, onSaveTestCase, onDe
         </div>
       </div>
 
+      {validationChecks && (
+        <div className={`border-b px-6 py-3 flex-shrink-0 ${validationErrorCount>0?"bg-red-50 border-red-200":validationWarningCount>0?"bg-amber-50 border-amber-200":"bg-green-50 border-green-200"}`}>
+          <div className="flex items-start gap-3">
+            {validationErrorCount>0
+              ? <X size={15} className="text-red-600 flex-shrink-0 mt-0.5"/>
+              : validationWarningCount>0
+                ? <AlertCircle size={15} className="text-amber-600 flex-shrink-0 mt-0.5"/>
+                : <CheckCircle2 size={15} className="text-green-600 flex-shrink-0 mt-0.5"/>
+            }
+            <div className="flex-1 min-w-0">
+              <div className={`text-xs font-semibold ${validationErrorCount>0?"text-red-700":validationWarningCount>0?"text-amber-700":"text-green-700"}`}>
+                {validationPassed ? validationWarningCount>0 ? "Validation passed with warnings" : "Validation passed" : "Validation failed"}
+              </div>
+              <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 mt-2">
+                {validationChecks.map(check=>(
+                  <div key={check.label} className="flex items-start gap-2 text-xs">
+                    {check.severity==="pass" && <CheckCircle2 size={11} className="text-green-600 flex-shrink-0 mt-0.5"/>}
+                    {check.severity==="warning" && <AlertCircle size={11} className="text-amber-600 flex-shrink-0 mt-0.5"/>}
+                    {check.severity==="error" && <X size={11} className="text-red-600 flex-shrink-0 mt-0.5"/>}
+                    <div><span className="font-medium text-gray-800">{check.label}:</span> <span className="text-gray-600">{check.detail}</span></div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <button onClick={()=>setValidationChecks(null)} className="text-gray-400 hover:text-gray-600"><X size={14}/></button>
+          </div>
+        </div>
+      )}
+
       <TabBar tabs={tabs} active={tab} onChange={setTab}/>
 
       <div className="flex-1 overflow-hidden">
@@ -1489,7 +2203,7 @@ function RuleFunctionView({ fn, setFn, allRules, testCases, onSaveTestCase, onDe
         {tab==="I/O Contract"  && <IOContractTab fn={fn} allRules={allRules}/>}
         {tab==="Test Cases"    && <TestCasesTab fnKey={fn.key} testCases={testCases} onRun={id=>{}} onDelete={onDeleteTestCase}/>}
         {tab==="Simulation"    && <SimulationTab fn={fn} allRules={allRules} onSaveTestCase={onSaveTestCase}/>}
-        {tab==="Change History"&& <div className="flex items-center justify-center h-full text-gray-400 text-sm bg-[#F1F4F8]">Change History</div>}
+        {tab==="Change History"&& <ChangeHistoryTab fn={fn} allRules={allRules} testCases={testCases}/>}
       </div>
     </div>
   );
@@ -1512,6 +2226,28 @@ const CREATION_STEPS: AIWorksStep[] = [
   { type:"write",    label:"Calling Draft Function API — creating SUSTAIN-CHECK-003 as maker-owned draft", status:"pending" },
 ];
 
+function getRuleAssistantSteps(context: AssistantContext): AIWorksStep[] {
+  if (context.source === "function") {
+    return [
+      { type:"read",     label:`Loading ${context.ruleId} from the Decision Studio rule function workspace`, status:"pending" },
+      { type:"analyze",  label:"Reviewing rule flow, I/O contract, tests and simulation evidence", status:"pending" },
+      { type:"analyze",  label:`Checking draft status, regression coverage and release readiness for ${context.ruleName}`, status:"pending" },
+      { type:"create",   label:"Preparing maker-editable improvement notes for the rule function", status:"pending" },
+      { type:"validate", label:"Checking recommendations against current frontend rule composition", status:"pending" },
+      { type:"write",    label:"Saving assistant recommendations in the prototype workspace only", status:"pending" },
+    ];
+  }
+
+  return [
+    { type:"read",     label:`Loading ${context.ruleId} from the Decision Studio rule library`, status:"pending" },
+    { type:"analyze",  label:`Interpreting ${context.ruleType} logic and current output contract`, status:"pending" },
+    { type:"analyze",  label:`Checking inputs, outputs and reason-code traceability for ${context.ruleName}`, status:"pending" },
+    { type:"create",   label:"Preparing maker-editable draft notes for the selected rule", status:"pending" },
+    { type:"validate", label:"Checking draft notes against the existing frontend I/O contract", status:"pending" },
+    { type:"write",    label:"Saving assistant recommendations in the prototype workspace only", status:"pending" },
+  ];
+}
+
 const STEP_CLS: Record<string, string> = {
   read:     "bg-blue-50 text-blue-700 border border-blue-200",
   analyze:  "bg-purple-50 text-purple-700 border border-purple-200",
@@ -1520,8 +2256,9 @@ const STEP_CLS: Record<string, string> = {
   write:    "bg-orange-100 text-orange-800 border border-orange-300",
 };
 
-function AIWorksScreen({ go }: { go: (s: Screen) => void }) {
+function AIWorksScreen({ go, assistantContext }: { go: (s: Screen) => void; assistantContext?: AssistantContext|null }) {
   const [input, setInput]     = useState("");
+  const [conversationPrompt, setConversationPrompt] = useState("");
   const [phase, setPhase]     = useState<AIWorksPhase>("idle");
   const [steps, setSteps]     = useState<AIWorksStep[]>([]);
   const [draftReady, setDraftReady] = useState(false);
@@ -1529,12 +2266,16 @@ function AIWorksScreen({ go }: { go: (s: Screen) => void }) {
   const timerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const SAMPLE_REQUEST = "Create a Sustainability Suitability Check function for wealth advisory. It should evaluate ESG score, green investment allocation percentage, and controversial sector exposure to determine if a portfolio meets our sustainability policy.";
+  const contextPrompt = assistantContext?.prompt ?? SAMPLE_REQUEST;
 
   const runCreation = (userMsg: string) => {
     if (phase === "running") return;
+    const request = userMsg || contextPrompt;
+    setConversationPrompt(request);
     setPhase("running");
     setDraftReady(false);
-    const fresh = CREATION_STEPS.map(s => ({ ...s, status: "pending" as const }));
+    const sourceSteps = assistantContext ? getRuleAssistantSteps(assistantContext) : CREATION_STEPS;
+    const fresh = sourceSteps.map(s => ({ ...s, status: "pending" as const }));
     setSteps(fresh);
 
     fresh.forEach((_, i) => {
@@ -1554,10 +2295,28 @@ function AIWorksScreen({ go }: { go: (s: Screen) => void }) {
     setTimeout(() => setSteps(prev => prev.map((s, j) => j === 0 ? { ...s, status: "running" } : s)), 100);
   };
 
+  useEffect(() => {
+    if (!assistantContext) return;
+    setInput(assistantContext.prompt);
+    setConversationPrompt(assistantContext.prompt);
+    setPhase("idle");
+    setSteps([]);
+    setDraftReady(false);
+  }, [assistantContext?.ruleId]);
+
   useEffect(() => { return () => { if (timerRef.current) clearTimeout(timerRef.current); }; }, []);
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [steps, draftReady]);
 
   const hasConversation = phase !== "idle";
+  const contextLabel = assistantContext?.source === "function" ? "rule function" : "rule";
+  const contextTitle = assistantContext?.source === "function" ? "Rule Function Assistance Preview" : "Rule Assistance Preview";
+  const selectedLabel = assistantContext?.source === "function" ? "Selected Rule Function" : "Selected Rule";
+  const assistantFocus = assistantContext?.source === "function"
+    ? ["Explain current rule-function flow","Review I/O contract and regression coverage","Prepare maker-editable improvement notes","Keep production unchanged"]
+    : ["Explain current rule logic","Review input and output contract","Prepare maker-editable draft notes","Keep production unchanged"];
+  const assistantIntro = assistantContext
+    ? `Understood. I am reviewing ${assistantContext.ruleName} (${assistantContext.ruleId}) in Decision Studio. I will summarize the current ${contextLabel} setup, check its governance evidence, and prepare maker-editable notes without changing production rules.`
+    : "Understood. I identified three rule families for a Sustainability Suitability Check: ESG Score evaluation, Green Allocation threshold check, and Controversial Sector screening. Creating the draft rule function now.";
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -1571,7 +2330,7 @@ function AIWorksScreen({ go }: { go: (s: Screen) => void }) {
             </div>
             <div>
               <h1 className="text-sm font-semibold text-gray-900">AI Works</h1>
-              <p className="text-[10px] text-gray-400">Describe a rule function in plain language. AI Works creates a draft for your review.</p>
+              <p className="text-[10px] text-gray-400">{assistantContext ? "Contextual assistance from Decision Studio." : "Describe a rule function in plain language. AI Works creates a draft for your review."}</p>
             </div>
           </div>
         </div>
@@ -1587,8 +2346,21 @@ function AIWorksScreen({ go }: { go: (s: Screen) => void }) {
             </p>
           </div>
 
+          {assistantContext && !hasConversation && (
+            <div className="bg-blue-50 border border-blue-200 rounded p-3">
+              <div className="flex items-center gap-2 mb-1.5">
+                <Sparkles size={12} className="text-[#1E3A6B]"/>
+                <span className="text-xs font-semibold text-[#1E3A6B]">Decision Studio context loaded</span>
+                <code className="ml-auto text-[10px] text-blue-700 bg-white/70 border border-blue-100 px-1.5 py-0.5 rounded">{assistantContext.ruleId}</code>
+              </div>
+              <p className="text-xs text-blue-900 leading-relaxed">
+                The assistant is ready to review <strong>{assistantContext.ruleName}</strong>, explain its {contextLabel} setup, and prepare frontend-only notes for maker review.
+              </p>
+            </div>
+          )}
+
           {/* If no conversation yet, show capability cards */}
-          {!hasConversation && (
+          {!hasConversation && !assistantContext && (
             <div className="space-y-3">
               <p className="text-xs text-gray-500 text-center">Tell AI Works what rule function you need — describe the business objective in plain language.</p>
               <div className="grid grid-cols-2 gap-2">
@@ -1614,7 +2386,7 @@ function AIWorksScreen({ go }: { go: (s: Screen) => void }) {
               <div className="w-7 h-7 rounded-full bg-[#1E3A6B] flex items-center justify-center text-white text-xs font-bold flex-shrink-0">JW</div>
               <div className="flex-1 bg-[#F1F4F8] rounded-lg p-3">
                 <div className="text-[10px] font-semibold text-gray-500 mb-1">Jennifer Wong · Maker</div>
-                <p className="text-xs text-gray-800 leading-relaxed">{SAMPLE_REQUEST}</p>
+                <p className="text-xs text-gray-800 leading-relaxed">{conversationPrompt || contextPrompt}</p>
               </div>
             </div>
           )}
@@ -1629,7 +2401,7 @@ function AIWorksScreen({ go }: { go: (s: Screen) => void }) {
                 <div className="text-[10px] font-semibold text-[#1E3A6B] mb-1.5">AI Works</div>
                 <div className="bg-white border border-gray-200 rounded-lg p-3 space-y-1">
                   <p className="text-xs text-gray-700 mb-3 leading-relaxed">
-                    Understood. I identified three rule families for a Sustainability Suitability Check: ESG Score evaluation, Green Allocation threshold check, and Controversial Sector screening. Creating the draft rule function now.
+                    {assistantIntro}
                   </p>
 
                   {/* Action timeline */}
@@ -1657,7 +2429,9 @@ function AIWorksScreen({ go }: { go: (s: Screen) => void }) {
                         <span className="text-xs font-semibold text-orange-700">No production rules modified.</span>
                       </div>
                       <p className="text-xs text-orange-600 leading-relaxed">
-                        Draft <code className="font-mono">SUSTAIN-CHECK-003</code> created via Draft Function API. Production is unchanged. Maker review and checker approval required before release.
+                        {assistantContext
+                          ? <>Assistant notes for <code className="font-mono">{assistantContext.ruleId}</code> are ready in this frontend prototype. Production is unchanged.</>
+                          : <>Draft <code className="font-mono">SUSTAIN-CHECK-003</code> created via Draft Function API. Production is unchanged. Maker review and checker approval required before release.</>}
                       </p>
                     </div>
                   )}
@@ -1675,19 +2449,19 @@ function AIWorksScreen({ go }: { go: (s: Screen) => void }) {
             <textarea
               value={input}
               onChange={e => setInput(e.target.value)}
-              placeholder="Describe the rule function you need in plain language…"
+              placeholder={assistantContext ? `Ask about this ${contextLabel} or draft a controlled change…` : "Describe the rule function you need in plain language…"}
               rows={2}
               className="flex-1 text-xs border border-gray-200 rounded px-3 py-2 resize-none focus:outline-none focus:border-[#1E3A6B] placeholder-gray-400"
             />
             <button
-              onClick={() => runCreation(input || SAMPLE_REQUEST)}
+              onClick={() => runCreation(input || contextPrompt)}
               disabled={phase === "running"}
               className="flex items-center gap-1.5 px-4 py-2 bg-[#1E3A6B] text-white rounded text-xs font-semibold hover:bg-[#163059] disabled:opacity-50 self-end">
               {phase === "running" ? <RefreshCw size={12} className="animate-spin" /> : <Wand2 size={12} />}
-              {phase === "running" ? "Creating…" : "Generate"}
+              {phase === "running" ? "Creating…" : assistantContext ? "Ask" : "Generate"}
             </button>
           </div>
-          <p className="text-[10px] text-gray-400 mt-1.5 ml-1">AI Works will create all rules, the I/O contract and test cases as a draft for your review.</p>
+          <p className="text-[10px] text-gray-400 mt-1.5 ml-1">{assistantContext ? `AI Works will prepare frontend-only guidance for the selected ${contextLabel}.` : "AI Works will create all rules, the I/O contract and test cases as a draft for your review."}</p>
         </div>
       </div>
 
@@ -1695,7 +2469,7 @@ function AIWorksScreen({ go }: { go: (s: Screen) => void }) {
       <div className="overflow-y-auto bg-[#F1F4F8] p-4" style={{ flex: "0 0 38%" }}>
         <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
           <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
-            <span className="text-xs font-semibold text-gray-900">Draft Preview</span>
+            <span className="text-xs font-semibold text-gray-900">{assistantContext ? contextTitle : "Draft Preview"}</span>
             {draftReady
               ? <StatusBadge status="AI-Assisted Draft" size="xs" />
               : <span className="text-[10px] text-gray-400">{phase === "running" ? "Building…" : "Awaiting generation"}</span>
@@ -1703,90 +2477,126 @@ function AIWorksScreen({ go }: { go: (s: Screen) => void }) {
           </div>
           <div className="p-4 space-y-4">
 
-            {/* Function metadata */}
-            <div className={`space-y-2 transition-opacity ${draftReady ? "opacity-100" : "opacity-30"}`}>
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                <div><div className="text-gray-400 mb-0.5">Function Name</div><div className="font-semibold text-gray-900">Sustainability Suitability Check</div></div>
-                <div><div className="text-gray-400 mb-0.5">Function Key</div><code className="font-mono text-sm font-bold text-gray-800">SUSTAIN-CHECK-003</code></div>
-                <div><div className="text-gray-400 mb-0.5">Domain</div><div className="text-gray-700">Sustainable Wealth Advisory</div></div>
-                <div><div className="text-gray-400 mb-0.5">Owner</div><div className="text-gray-700">Advisory Solutions</div></div>
-              </div>
-            </div>
-
-            {/* Rule families created */}
-            <div className={`transition-opacity ${steps.length > 2 ? "opacity-100" : "opacity-20"}`}>
-              <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Rule Families Created</div>
-              <div className="space-y-1.5">
-                {[
-                  { name:"ESG Score Evaluation",           type:"ScoringMatrix",   done: steps.find(s=>s.label.includes("ESG"))?.status === "done" || draftReady },
-                  { name:"Green Investment Allocation",     type:"ThresholdMatrix", done: steps.find(s=>s.label.includes("Green"))?.status === "done" || draftReady },
-                  { name:"Controversial Sector Screening",  type:"ExclusionList",  done: steps.find(s=>s.label.includes("Controversial"))?.status === "done" || draftReady },
-                ].map(r => (
-                  <div key={r.name} className={`flex items-center gap-2.5 p-2 rounded border transition-all ${r.done ? "bg-white border-gray-200" : "bg-gray-50 border-gray-100 opacity-40"}`}>
-                    <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${r.done ? "bg-green-500" : "bg-gray-300"}`} />
-                    <span className="text-xs font-medium text-gray-800 flex-1">{r.name}</span>
-                    <span className={`text-[9px] px-1.5 py-0.5 rounded border font-medium ${ruleTypeCls[r.type]}`}>{r.type}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Stats */}
-            <div className={`grid grid-cols-3 gap-2 transition-opacity ${draftReady ? "opacity-100" : "opacity-20"}`}>
-              {[
-                { label:"Rules Created",      value:"3",   color:"text-[#1E3A6B]" },
-                { label:"Validation Errors",  value:"0",   color:"text-green-700" },
-                { label:"Test Cases",         value:"6",   color:"text-blue-700"  },
-              ].map(m => (
-                <div key={m.label} className="bg-gray-50 border border-gray-200 rounded p-2.5 text-center">
-                  <div className={`text-xl font-bold ${m.color}`}>{m.value}</div>
-                  <div className="text-[9px] text-gray-400 mt-0.5 leading-tight">{m.label}</div>
+            {assistantContext && (
+              <div className="bg-blue-50 border border-blue-200 rounded p-3">
+                <div className="text-[10px] font-semibold text-blue-600 uppercase tracking-wide mb-2">{selectedLabel}</div>
+                <div className="space-y-1.5 text-xs">
+                  <div className="flex justify-between gap-3"><span className="text-gray-500">Name</span><span className="font-semibold text-gray-900 text-right">{assistantContext.ruleName}</span></div>
+                  <div className="flex justify-between gap-3"><span className="text-gray-500">{assistantContext.source === "function" ? "Function Key" : "Rule ID"}</span><code className="font-mono text-[#1E3A6B]">{assistantContext.ruleId}</code></div>
+                  <div className="flex justify-between gap-3"><span className="text-gray-500">Type</span><span className="font-medium text-gray-900">{assistantContext.ruleType}</span></div>
                 </div>
-              ))}
-            </div>
+                <div className="mt-3 pt-3 border-t border-blue-200 text-xs text-blue-900 leading-relaxed">
+                  {draftReady ? "Assistant recommendations are ready for maker review in this prototype." : `Run the assistant to explain the ${contextLabel} setup and prepare draft-edit guidance.`}
+                </div>
+              </div>
+            )}
 
-            {/* I/O contract summary */}
-            <div className={`transition-opacity ${draftReady ? "opacity-100" : "opacity-20"}`}>
-              <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Auto-generated I/O Contract</div>
-              <div className="space-y-1">
-                {[
-                  { dir:"IN",  field:"esgScore",              type:"number" },
-                  { dir:"IN",  field:"greenAllocationPct",    type:"number" },
-                  { dir:"IN",  field:"controversialFlags",    type:"array"  },
-                  { dir:"IN",  field:"cip",                   type:"enum"   },
-                  { dir:"OUT", field:"sustainabilityRating",  type:"number" },
-                  { dir:"OUT", field:"sustainabilityEligible",type:"boolean"},
-                  { dir:"OUT", field:"reasonCodes",           type:"array"  },
-                ].map(f => (
-                  <div key={f.field} className="flex items-center gap-2 text-xs">
-                    <span className={`text-[9px] font-bold w-6 flex-shrink-0 ${f.dir === "IN" ? "text-blue-600" : "text-green-600"}`}>{f.dir}</span>
-                    <code className="font-mono text-gray-800 flex-1">{f.field}</code>
-                    <TypeChip type={f.type} />
+            {assistantContext ? (
+              <>
+                <div className={`space-y-2 transition-opacity ${draftReady ? "opacity-100" : "opacity-40"}`}>
+                  <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">Assistant Focus</div>
+                  {assistantFocus.map(item => (
+                    <div key={item} className="flex items-center gap-2 bg-white border border-gray-200 rounded px-3 py-2 text-xs">
+                      <CheckCircle2 size={12} className={draftReady ? "text-green-600" : "text-gray-300"}/>
+                      <span className={draftReady ? "text-gray-800" : "text-gray-500"}>{item}</span>
+                    </div>
+                  ))}
+                </div>
+                <div className={`space-y-2 border-t border-gray-100 pt-3 transition-opacity ${draftReady ? "opacity-100" : "opacity-50"}`}>
+                  <button onClick={() => go("studio")}
+                    className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-[#1E3A6B] text-white rounded text-xs font-semibold hover:bg-[#163059]">
+                    <Layers size={12} />Return to Decision Studio
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                {/* Function metadata */}
+                <div className={`space-y-2 transition-opacity ${draftReady ? "opacity-100" : "opacity-30"}`}>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div><div className="text-gray-400 mb-0.5">Function Name</div><div className="font-semibold text-gray-900">Sustainability Suitability Check</div></div>
+                    <div><div className="text-gray-400 mb-0.5">Function Key</div><code className="font-mono text-sm font-bold text-gray-800">SUSTAIN-CHECK-003</code></div>
+                    <div><div className="text-gray-400 mb-0.5">Domain</div><div className="text-gray-700">Sustainable Wealth Advisory</div></div>
+                    <div><div className="text-gray-400 mb-0.5">Owner</div><div className="text-gray-700">Advisory Solutions</div></div>
                   </div>
-                ))}
-              </div>
-            </div>
+                </div>
 
-            {/* Actions */}
-            <div className={`space-y-2 border-t border-gray-100 pt-3 transition-opacity ${draftReady ? "opacity-100" : "opacity-30 pointer-events-none"}`}>
-              <button onClick={() => go("studio")}
-                className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-[#1E3A6B] text-white rounded text-xs font-semibold hover:bg-[#163059]">
-                <Layers size={12} />Open in Decision Studio
-              </button>
-              <button className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50">
-                <GitBranch size={12} />View Decision Tree
-              </button>
-              <button onClick={() => { setPhase("idle"); setSteps([]); setDraftReady(false); }}
-                className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-red-200 text-red-600 rounded text-xs hover:bg-red-50">
-                <X size={12} />Discard Draft
-              </button>
-            </div>
+                {/* Rule families created */}
+                <div className={`transition-opacity ${steps.length > 2 ? "opacity-100" : "opacity-20"}`}>
+                  <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Rule Families Created</div>
+                  <div className="space-y-1.5">
+                    {[
+                      { name:"ESG Score Evaluation",           type:"ScoringMatrix",   done: steps.find(s=>s.label.includes("ESG"))?.status === "done" || draftReady },
+                      { name:"Green Investment Allocation",     type:"ThresholdMatrix", done: steps.find(s=>s.label.includes("Green"))?.status === "done" || draftReady },
+                      { name:"Controversial Sector Screening",  type:"ExclusionList",  done: steps.find(s=>s.label.includes("Controversial"))?.status === "done" || draftReady },
+                    ].map(r => (
+                      <div key={r.name} className={`flex items-center gap-2.5 p-2 rounded border transition-all ${r.done ? "bg-white border-gray-200" : "bg-gray-50 border-gray-100 opacity-40"}`}>
+                        <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${r.done ? "bg-green-500" : "bg-gray-300"}`} />
+                        <span className="text-xs font-medium text-gray-800 flex-1">{r.name}</span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded border font-medium ${ruleTypeCls[r.type]}`}>{r.type}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
 
-            {!draftReady && phase === "idle" && (
-              <div className="py-6 text-center">
-                <Wand2 size={28} className="mx-auto mb-2 text-gray-300" />
-                <div className="text-xs text-gray-400">Describe your rule function on the left to get started.</div>
-              </div>
+                {/* Stats */}
+                <div className={`grid grid-cols-3 gap-2 transition-opacity ${draftReady ? "opacity-100" : "opacity-20"}`}>
+                  {[
+                    { label:"Rules Created",      value:"3",   color:"text-[#1E3A6B]" },
+                    { label:"Validation Errors",  value:"0",   color:"text-green-700" },
+                    { label:"Test Cases",         value:"6",   color:"text-blue-700"  },
+                  ].map(m => (
+                    <div key={m.label} className="bg-gray-50 border border-gray-200 rounded p-2.5 text-center">
+                      <div className={`text-xl font-bold ${m.color}`}>{m.value}</div>
+                      <div className="text-[9px] text-gray-400 mt-0.5 leading-tight">{m.label}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* I/O contract summary */}
+                <div className={`transition-opacity ${draftReady ? "opacity-100" : "opacity-20"}`}>
+                  <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Auto-generated I/O Contract</div>
+                  <div className="space-y-1">
+                    {[
+                      { dir:"IN",  field:"esgScore",              type:"number" },
+                      { dir:"IN",  field:"greenAllocationPct",    type:"number" },
+                      { dir:"IN",  field:"controversialFlags",    type:"array"  },
+                      { dir:"IN",  field:"cip",                   type:"enum"   },
+                      { dir:"OUT", field:"sustainabilityRating",  type:"number" },
+                      { dir:"OUT", field:"sustainabilityEligible",type:"boolean"},
+                      { dir:"OUT", field:"reasonCodes",           type:"array"  },
+                    ].map(f => (
+                      <div key={f.field} className="flex items-center gap-2 text-xs">
+                        <span className={`text-[9px] font-bold w-6 flex-shrink-0 ${f.dir === "IN" ? "text-blue-600" : "text-green-600"}`}>{f.dir}</span>
+                        <code className="font-mono text-gray-800 flex-1">{f.field}</code>
+                        <TypeChip type={f.type} />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Actions */}
+                <div className={`space-y-2 border-t border-gray-100 pt-3 transition-opacity ${draftReady ? "opacity-100" : "opacity-30 pointer-events-none"}`}>
+                  <button onClick={() => go("studio")}
+                    className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-[#1E3A6B] text-white rounded text-xs font-semibold hover:bg-[#163059]">
+                    <Layers size={12} />Open in Decision Studio
+                  </button>
+                  <button className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50">
+                    <GitBranch size={12} />View Decision Tree
+                  </button>
+                  <button onClick={() => { setPhase("idle"); setSteps([]); setDraftReady(false); }}
+                    className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-red-200 text-red-600 rounded text-xs hover:bg-red-50">
+                    <X size={12} />Discard Draft
+                  </button>
+                </div>
+
+                {!draftReady && phase === "idle" && (
+                  <div className="py-6 text-center">
+                    <Wand2 size={28} className="mx-auto mb-2 text-gray-300" />
+                    <div className="text-xs text-gray-400">Describe your rule function on the left to get started.</div>
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -1797,28 +2607,49 @@ function AIWorksScreen({ go }: { go: (s: Screen) => void }) {
 
 // ─── Decision Studio ──────────────────────────────────────────────────────────
 
-function DecisionStudio({ fnKey, setFnKey, go }:{ fnKey:string; setFnKey:(k:string)=>void; go:(s:Screen)=>void }) {
+function DecisionStudio({
+  fnKey, setFnKey, go, onAskRuleAssistant, onAskFunctionAssistant,
+}: {
+  fnKey:string;
+  setFnKey:(k:string)=>void;
+  go:(s:Screen)=>void;
+  onAskRuleAssistant:(rule: Rule)=>void;
+  onAskFunctionAssistant:(fn: RuleFunctionDef)=>void;
+}) {
   const [view,      setView]      = useState<StudioView>("function");
   const [selRuleId, setSelRuleId] = useState<string|null>(null);
-  const [rulesOpen, setRulesOpen] = useState(true);
-  const [fnsOpen,   setFnsOpen]   = useState(true);
+  const [studioNavTab, setStudioNavTab] = useState<"functions"|"rules">("functions");
   const [ruleSearch,setRuleSearch]= useState("");
   const [testCases, setTestCases] = useState<TestCase[]>(INITIAL_TEST_CASES);
+  const [ruleDrafts, setRuleDrafts] = useState<Record<string,string>>({});
   // Local copies of functions (so we can mutate rule lists)
   const [localFns,  setLocalFns]  = useState<RuleFunctionDef[]>(RULE_FUNCTIONS);
 
   const selRule = RULES.find(r=>r.id===selRuleId);
   const selFn   = localFns.find(f=>f.key===fnKey)??localFns[0];
 
-  const filteredRules = RULES.filter(r=>r.name.toLowerCase().includes(ruleSearch.toLowerCase()));
+  const searchTerm = ruleSearch.toLowerCase();
+  const filteredRules = RULES.filter(r=>
+    r.name.toLowerCase().includes(searchTerm) ||
+    r.id.toLowerCase().includes(searchTerm) ||
+    r.type.toLowerCase().includes(searchTerm)
+  );
+  const filteredFns = localFns.filter(fn=>
+    fn.name.toLowerCase().includes(searchTerm) ||
+    fn.key.toLowerCase().includes(searchTerm) ||
+    fn.domain.toLowerCase().includes(searchTerm)
+  );
 
   const updateFn = (fn:RuleFunctionDef) => setLocalFns(prev=>prev.map(f=>f.key===fn.key?fn:f));
 
-  const openFn = (key:string) => { setFnKey(key); setView("function"); };
-  const openRule = (id:string) => { setSelRuleId(id); setView("rule"); };
+  const openFn = (key:string) => { setFnKey(key); setView("function"); setStudioNavTab("functions"); };
+  const openRule = (id:string) => { setSelRuleId(id); setView("rule"); setStudioNavTab("rules"); };
 
   const handleSaveTestCase = (tc:TestCase) => setTestCases(p=>[...p, tc]);
   const handleDeleteTestCase = (id:string) => setTestCases(p=>p.filter(tc=>tc.id!==id));
+  const handleSaveRuleDraft = (ruleId:string, draftText:string) => {
+    setRuleDrafts(prev => ({ ...prev, [ruleId]: draftText }));
+  };
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -1829,65 +2660,71 @@ function DecisionStudio({ fnKey, setFnKey, go }:{ fnKey:string; setFnKey:(k:stri
           <div className="text-[10px] text-gray-400 mt-0.5">Rules &amp; rule functions</div>
         </div>
         <div className="px-3 py-2 border-b border-gray-100 flex-shrink-0">
+          <div className="grid grid-cols-2 gap-1 bg-gray-100 rounded p-0.5">
+            {[
+              { id:"functions", label:"Rule Functions", count:localFns.length },
+              { id:"rules", label:"Rule Library", count:RULES.length },
+            ].map(tab=>(
+              <button key={tab.id} onClick={()=>setStudioNavTab(tab.id as "functions"|"rules")}
+                className={`px-2 py-1.5 rounded text-[10px] font-semibold transition-colors ${studioNavTab===tab.id?"bg-white text-[#1E3A6B] shadow-sm":"text-gray-500 hover:text-gray-700"}`}>
+                <span>{tab.label}</span>
+                <span className="ml-1 text-[9px] opacity-60">{tab.count}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="px-3 py-2 border-b border-gray-100 flex-shrink-0">
           <div className="flex items-center gap-1.5 bg-gray-50 border border-gray-200 rounded px-2.5 py-1.5">
             <Search size={11} className="text-gray-400"/>
-            <input value={ruleSearch} onChange={e=>setRuleSearch(e.target.value)} placeholder="Search rules…" className="flex-1 text-[11px] bg-transparent outline-none"/>
+            <input value={ruleSearch} onChange={e=>setRuleSearch(e.target.value)} placeholder={studioNavTab==="functions"?"Search rule functions…":"Search rules…"} className="flex-1 text-[11px] bg-transparent outline-none"/>
           </div>
         </div>
 
         <div className="flex-1 overflow-y-auto">
-          {/* Rules Library */}
-          <div>
-            <button onClick={()=>setRulesOpen(p=>!p)}
-              className="w-full flex items-center gap-2 px-4 py-2 hover:bg-gray-50 transition-colors">
-              <ChevronDown size={11} className={`text-gray-400 transition-transform ${rulesOpen?"":"-rotate-90"}`}/>
-              <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide flex-1 text-left">Rules Library</span>
-              <span className="text-[10px] text-gray-400">{RULES.length}</span>
-              <button onClick={e=>{e.stopPropagation();}} className="text-gray-300 hover:text-[#1E3A6B] ml-1"><Plus size={11}/></button>
-            </button>
-            {rulesOpen && filteredRules.map(rule=>(
-              <button key={rule.id} onClick={()=>openRule(rule.id)}
-                className={`w-full flex items-start gap-2 px-4 py-2 text-left hover:bg-gray-50 transition-colors border-l-2 ${view==="rule"&&selRuleId===rule.id?"bg-blue-50 border-l-[#1E3A6B]":"border-l-transparent"}`}>
-                <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 mt-1.5 ${rule.modified?"bg-amber-400":"bg-gray-300"}`}/>
-                <div className="min-w-0 flex-1">
-                  <div className="text-[11px] font-medium text-gray-800 leading-tight truncate">{rule.name}</div>
-                  <div className="text-[9px] text-gray-400 mt-0.5">{rule.type}</div>
-                </div>
-              </button>
-            ))}
-          </div>
-
-          {/* Rule Functions */}
-          <div className="border-t border-gray-100">
-            <button onClick={()=>setFnsOpen(p=>!p)}
-              className="w-full flex items-center gap-2 px-4 py-2 hover:bg-gray-50 transition-colors">
-              <ChevronDown size={11} className={`text-gray-400 transition-transform ${fnsOpen?"":"-rotate-90"}`}/>
-              <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide flex-1 text-left">Rule Functions</span>
-              <span className="text-[10px] text-gray-400">{localFns.length}</span>
-              <button onClick={e=>{e.stopPropagation();}} className="text-gray-300 hover:text-[#1E3A6B] ml-1"><Plus size={11}/></button>
-            </button>
-            {fnsOpen && (
-              <>
-                {localFns.map(fn=>(
-                  <button key={fn.key} onClick={()=>openFn(fn.key)}
-                    className={`w-full flex items-start gap-2 px-4 py-2.5 text-left hover:bg-gray-50 transition-colors border-l-2 ${view==="function"&&fnKey===fn.key?"bg-blue-50 border-l-[#1E3A6B]":"border-l-transparent"}`}>
-                    <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 mt-1.5 ${fn.draftRelease?"bg-amber-400":"bg-green-400"}`}/>
-                    <div className="min-w-0 flex-1">
-                      <div className="text-[11px] font-medium text-gray-800 leading-tight">{fn.name}</div>
-                      <div className="flex items-center gap-1.5 mt-0.5">
-                        <code className="font-mono text-[9px] text-gray-400">{fn.activeRelease}</code>
-                        {fn.draftRelease&&<code className="font-mono text-[9px] text-amber-500">{fn.draftRelease}</code>}
-                        <span className="text-[9px] text-gray-400">{fn.ruleIds.length} rules</span>
-                      </div>
+          {studioNavTab==="functions" ? (
+            <div>
+              <div className="flex items-center gap-2 px-4 py-2">
+                <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide flex-1">Rule Functions</span>
+                <button onClick={()=>{}} className="text-gray-300 hover:text-[#1E3A6B]"><Plus size={11}/></button>
+              </div>
+              {filteredFns.map(fn=>(
+                <button key={fn.key} onClick={()=>openFn(fn.key)}
+                  className={`w-full flex items-start gap-2 px-4 py-2.5 text-left hover:bg-gray-50 transition-colors border-l-2 ${view==="function"&&fnKey===fn.key?"bg-blue-50 border-l-[#1E3A6B]":"border-l-transparent"}`}>
+                  <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 mt-1.5 ${fn.draftRelease?"bg-amber-400":"bg-green-400"}`}/>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[11px] font-medium text-gray-800 leading-tight">{fn.name}</div>
+                    <div className="flex items-center gap-1.5 mt-0.5">
+                      <code className="font-mono text-[9px] text-gray-400">{fn.activeRelease}</code>
+                      {fn.draftRelease&&<code className="font-mono text-[9px] text-amber-500">{fn.draftRelease}</code>}
+                      <span className="text-[9px] text-gray-400">{fn.ruleIds.length} rules</span>
                     </div>
-                  </button>
-                ))}
-                <button onClick={()=>{}} className="w-full flex items-center gap-2 px-4 py-2 text-[11px] text-[#1E3A6B] hover:bg-blue-50 transition-colors">
-                  <Plus size={11}/><span className="font-medium">Create Rule Function</span>
+                  </div>
                 </button>
-              </>
-            )}
-          </div>
+              ))}
+              {filteredFns.length===0 && <div className="px-4 py-8 text-center text-xs text-gray-400">No rule functions found</div>}
+              <button onClick={()=>{}} className="w-full flex items-center gap-2 px-4 py-2 text-[11px] text-[#1E3A6B] hover:bg-blue-50 transition-colors">
+                <Plus size={11}/><span className="font-medium">Create Rule Function</span>
+              </button>
+            </div>
+          ) : (
+            <div>
+              <div className="flex items-center gap-2 px-4 py-2">
+                <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide flex-1">Rule Library</span>
+                <button onClick={()=>{}} className="text-gray-300 hover:text-[#1E3A6B]"><Plus size={11}/></button>
+              </div>
+              {filteredRules.map(rule=>(
+                <button key={rule.id} onClick={()=>openRule(rule.id)}
+                  className={`w-full flex items-start gap-2 px-4 py-2 text-left hover:bg-gray-50 transition-colors border-l-2 ${view==="rule"&&selRuleId===rule.id?"bg-blue-50 border-l-[#1E3A6B]":"border-l-transparent"}`}>
+                  <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 mt-1.5 ${rule.modified?"bg-amber-400":"bg-gray-300"}`}/>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[11px] font-medium text-gray-800 leading-tight truncate">{rule.name}</div>
+                    <div className="text-[9px] text-gray-400 mt-0.5">{rule.type}</div>
+                  </div>
+                </button>
+              ))}
+              {filteredRules.length===0 && <div className="px-4 py-8 text-center text-xs text-gray-400">No rules found</div>}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1902,214 +2739,18 @@ function DecisionStudio({ fnKey, setFnKey, go }:{ fnKey:string; setFnKey:(k:stri
             </div>
           </div>
         )}
-        {view==="rule"&&selRule&&<RuleEditorView rule={selRule}/>}
+        {view==="rule"&&selRule&&(
+          <RuleEditorView
+            rule={selRule}
+            savedDraft={ruleDrafts[selRule.id]}
+            onSaveDraft={handleSaveRuleDraft}
+            onAskAssistant={onAskRuleAssistant}
+          />
+        )}
         {view==="function"&&selFn&&(
           <RuleFunctionView fn={selFn} setFn={updateFn} allRules={RULES}
-            testCases={testCases} onSaveTestCase={handleSaveTestCase} onDeleteTestCase={handleDeleteTestCase} go={go}/>
+            testCases={testCases} onSaveTestCase={handleSaveTestCase} onDeleteTestCase={handleDeleteTestCase} go={go} onAskAssistant={onAskFunctionAssistant}/>
         )}
-      </div>
-    </div>
-  );
-}
-
-// ─── Decision Catalog ─────────────────────────────────────────────────────────
-
-function DecisionCatalog({ go, setStudioFn }:{ go:(s:Screen)=>void; setStudioFn:(k:string)=>void }) {
-  const goFn=(key:string)=>{setStudioFn(key);go("studio");};
-  const metrics=[
-    {label:"Active Decisions",value:"126",accent:""},
-    {label:"Portfolio Rule Families",value:"10",accent:""},
-    {label:"My Drafts Requiring Review",value:"4",accent:"text-amber-600"},
-    {label:"Pending Checker Approval",value:"12",accent:"text-blue-600"},
-    {label:"Simulation Runs This Week",value:"38",accent:""},
-    {label:"Validation Issues",value:"2",accent:"text-red-600"},
-  ];
-  const rows=[
-    {name:"Portfolio Strength Rating",fnKey:"PS",bc:"Portfolio Strength",domain:"Wealth Advisory Portfolio Health",release:"v4.7",draft:"AI Draft Pending Maker Review",owner:"Advisory Solutions",mod:"13 Jun 2026"},
-    {name:"Investment Idea Suitability and Recommendation",fnKey:"II",bc:"Investment Idea",domain:"Advisory Recommendations",release:"v2.9",draft:"No Active Draft",owner:"Investment Advisory",mod:"08 Jun 2026"},
-    {name:"Portfolio Impact Simulation Policy",fnKey:"SIM",bc:"Simulation",domain:"Testing and Impact Analysis",release:"v1.6",draft:"Checker Review Required",owner:"Advisory Technology",mod:"11 Jun 2026"},
-  ];
-  const tasks=[
-    {text:"Review AI-assisted draft for Portfolio Strength Rating v4.8",type:"fn",fnKey:"PS",hi:true},
-    {text:"Inspect Simulation Lab result for 312 weakened portfolios",type:"screen",screen:"simulation" as Screen,hi:true},
-    {text:"Submit validation evidence for Investment Idea update",type:"fn",fnKey:"II",hi:false},
-  ];
-  const bcColor:Record<string,string>={"Portfolio Strength":"bg-[#1E3A6B]/10 text-[#1E3A6B]","Investment Idea":"bg-teal-50 text-teal-700","Simulation":"bg-purple-50 text-purple-700"};
-  return (
-    <div className="flex h-full">
-      <div className="flex-1 flex flex-col overflow-hidden">
-        <div className="bg-white border-b border-gray-200 px-6 py-4">
-          <div className="flex items-start justify-between">
-            <div><h1 className="text-lg font-semibold text-gray-900">Decision Catalog</h1><p className="text-xs text-gray-500 mt-0.5">Governed advisory decisions, simulations and runtime rule assets.</p></div>
-            <div className="flex items-center gap-2"><Btn icon={PenLine} label="Create Manually" onClick={()=>go("studio")}/><Btn icon={Sparkles} label="Create with AI" primary onClick={()=>go("studio")}/></div>
-          </div>
-          <div className="grid grid-cols-6 gap-2.5 mt-4">
-            {metrics.map(m=>(
-              <div key={m.label} className="bg-gray-50 border border-gray-200 rounded p-3">
-                <div className={`text-2xl font-bold leading-none ${m.accent||"text-gray-900"}`}>{m.value}</div>
-                <div className="text-[10px] text-gray-500 mt-1 leading-tight">{m.label}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-        <div className="bg-white border-b border-gray-200 px-6 py-2 flex items-center gap-2">
-          <div className="flex items-center gap-1.5 bg-gray-50 border border-gray-200 rounded px-3 py-1.5 w-52">
-            <Search size={11} className="text-gray-400"/>
-            <input className="flex-1 text-xs bg-transparent outline-none placeholder-gray-400" placeholder="Search name or key…"/>
-          </div>
-          {["Business Case","Domain","Status"].map(f=>(
-            <button key={f} className="flex items-center gap-1 px-2.5 py-1.5 border border-gray-200 rounded text-xs text-gray-600 hover:bg-gray-50">{f}<ChevronDown size={10} className="text-gray-400"/></button>
-          ))}
-        </div>
-        <div className="flex-1 overflow-auto">
-          <table className="w-full text-xs min-w-[900px]">
-            <thead className="sticky top-0 z-10 bg-gray-50"><tr>
-              {["Decision Name","Business Case","Domain","Active","Draft Status","Owner","Modified",""].map(h=>(
-                <th key={h} className="px-3 py-2 text-left font-medium text-gray-500 border-b border-gray-200 whitespace-nowrap">{h}</th>
-              ))}
-            </tr></thead>
-            <tbody className="bg-white divide-y divide-gray-100">
-              {rows.map(r=>(
-                <tr key={r.fnKey} className="hover:bg-blue-50/40 cursor-pointer" onClick={()=>goFn(r.fnKey)}>
-                  <td className="px-3 py-2.5"><span className="text-[#1E3A6B] font-medium hover:underline">{r.name}</span></td>
-                  <td className="px-3 py-2.5"><span className={`text-[10px] px-2 py-0.5 rounded font-medium ${bcColor[r.bc]}`}>{r.bc}</span></td>
-                  <td className="px-3 py-2.5 text-gray-500">{r.domain}</td>
-                  <td className="px-3 py-2.5"><code className="font-mono text-[10px] bg-gray-100 text-gray-700 px-1.5 py-0.5 rounded">{r.release}</code></td>
-                  <td className="px-3 py-2.5"><StatusBadge status={r.draft} size="xs"/></td>
-                  <td className="px-3 py-2.5 text-gray-500">{r.owner}</td>
-                  <td className="px-3 py-2.5 text-gray-400">{r.mod}</td>
-                  <td className="px-3 py-2.5"><button className="text-gray-400 hover:text-gray-600"><MoreHorizontal size={13}/></button></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-      <div className="w-[256px] flex-shrink-0 bg-white border-l border-gray-200 flex flex-col">
-        <div className="px-4 py-3 border-b border-gray-200"><div className="text-sm font-semibold text-gray-900">My Tasks</div><div className="text-[10px] text-gray-500 mt-0.5">Actions requiring your attention</div></div>
-        <div className="flex-1 overflow-auto">
-          {tasks.map((t,i)=>(
-            <div key={i} onClick={()=>t.type==="fn"?goFn((t as any).fnKey):go((t as any).screen)}
-              className="px-4 py-3 border-b border-gray-100 hover:bg-gray-50 cursor-pointer">
-              <div className="flex items-start gap-2"><div className={`mt-1 w-1.5 h-1.5 rounded-full flex-shrink-0 ${t.hi?"bg-amber-500":"bg-blue-400"}`}/><p className="text-xs text-gray-700 leading-relaxed">{t.text}</p></div>
-              <div className="flex items-center gap-1 mt-1.5 ml-3.5"><span className="text-[10px] text-gray-400">Due today</span><ChevronRight size={9} className="text-gray-400"/></div>
-            </div>
-          ))}
-        </div>
-        <div className="p-4 border-t border-gray-100"><GovernanceBanner/></div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Simulation Lab ───────────────────────────────────────────────────────────
-
-const ratingData=[
-  {rating:"R1 Strong",v47:2100,v48:2141},{rating:"R2 Good",v47:5820,v48:5779},
-  {rating:"R3 Moderate",v47:6890,v48:6578},{rating:"R4 Weak",v47:2890,v48:3202},{rating:"R5 Critical",v47:540,v48:540},
-];
-const driverData=[{family:"SAA Allocation",count:218},{family:"House View",count:94}];
-
-function SimulationLab({ go }:{ go:(s:Screen)=>void }) {
-  const [tab,setTab]=useState("Summary");
-  const scenarios=[
-    {seg:"Moderate-Balanced",cip:"Moderate",aum:"$500K–$2M",ar:3,dr:4,driver:"SAA Allocation",rc:"PS-SAA-GAP-004"},
-    {seg:"Moderate-Balanced",cip:"Moderate",aum:"$2M–$5M",ar:3,dr:4,driver:"SAA Allocation",rc:"PS-SAA-GAP-004"},
-    {seg:"Moderate-Growth",cip:"Moderate",aum:"$1M–$5M",ar:3,dr:4,driver:"House View",rc:"PS-HV-UW-002"},
-    {seg:"Moderate-Balanced",cip:"Moderate",aum:">$5M",ar:2,dr:3,driver:"SAA Allocation",rc:"PS-SAA-GAP-004"},
-    {seg:"Moderate-Income",cip:"Moderate",aum:"$200K–$500K",ar:3,dr:4,driver:"House View",rc:"PS-HV-UW-002"},
-  ];
-  return (
-    <div className="flex flex-col h-full">
-      <div className="bg-white border-b border-gray-200 px-6 py-3">
-        <div className="flex items-start justify-between mb-3">
-          <div>
-            <div className="text-xs text-gray-500 mb-1">Simulation Lab · Portfolio Strength Rating</div>
-            <h1 className="text-base font-semibold text-gray-900">Draft v4.8 vs Active v4.7</h1>
-            <div className="flex items-center gap-2 mt-1"><StatusBadge status="AI-Assisted" size="xs"/><span className="text-xs text-gray-500">Q2 Advisory Portfolio Cohort · 18,240 portfolios</span></div>
-          </div>
-          <div className="flex items-center gap-2">
-            <Btn icon={Play} label="Run Tests"/>
-            <Btn icon={Download} label="Export Evidence"/>
-            <Btn icon={PenLine} label="Return to Studio" primary onClick={()=>go("studio")}/>
-          </div>
-        </div>
-        <div className="flex items-center gap-2 pt-3 border-t border-gray-100 flex-wrap">
-          {[["Model Validation","Passed",true],["Regression Scenarios","118/118",true],["Boundary Scenarios","34",true],["Changed Outcomes","27",true],["Warnings","1",false]].map(([l,v,ok])=>(
-            <div key={l as string} className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs border ${ok?"bg-green-50 border-green-200 text-green-700":"bg-amber-50 border-amber-200 text-amber-700"}`}>
-              {ok?<CheckCircle2 size={10}/>:<AlertTriangle size={10}/>}<span className="font-medium">{l}:</span><span>{v}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-      <TabBar tabs={["Summary","Changed Scenarios","Rule Contribution"]} active={tab} onChange={setTab}/>
-      <div className="flex-1 overflow-y-auto p-4 bg-[#F1F4F8]">
-        {tab==="Summary"&&(
-          <>
-            <div className="grid grid-cols-6 gap-2.5 mb-4">
-              {[["Total","18,240","text-gray-900",""],["Unchanged","17,887","text-green-700","bg-green-50 border-green-200"],["Stronger","41","text-blue-700","bg-blue-50 border-blue-200"],["Weaker","312","text-red-600","bg-red-50 border-red-200"],["Advisor Review","41","text-amber-700","bg-amber-50 border-amber-200"],["Exceptions","0","text-green-700","bg-green-50 border-green-200"]].map(([l,v,c,bg])=>(
-                <div key={l} className={`bg-white border rounded p-3 text-center ${bg||"border-gray-200"}`}>
-                  <div className={`text-2xl font-bold leading-none ${c}`}>{v}</div>
-                  <div className="text-[10px] text-gray-500 mt-1">{l}</div>
-                </div>
-              ))}
-            </div>
-            <div className="grid grid-cols-3 gap-4">
-              <div className="col-span-2 bg-white border border-gray-200 rounded p-4">
-                <div className="text-sm font-semibold text-gray-900 mb-3">Rating Distribution: v4.7 vs v4.8</div>
-                <ResponsiveContainer width="100%" height={200}>
-                  <BarChart data={ratingData} barSize={18} barGap={3}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0"/>
-                    <XAxis dataKey="rating" tick={{fontSize:10,fill:"#6b7280"}}/>
-                    <YAxis tick={{fontSize:10,fill:"#6b7280"}}/>
-                    <Tooltip contentStyle={{fontSize:11,padding:"4px 10px",border:"1px solid #e5e7eb",borderRadius:"4px"}}/>
-                    <Legend wrapperStyle={{fontSize:11}}/>
-                    <Bar dataKey="v47" name="Active v4.7" fill="#1E3A6B" radius={[2,2,0,0]}/>
-                    <Bar dataKey="v48" name="Draft v4.8" fill="#0D7A8A" radius={[2,2,0,0]}/>
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="space-y-3">
-                <div className="bg-white border border-gray-200 rounded p-4">
-                  <div className="text-xs font-semibold text-gray-900 mb-3">Primary Change Drivers</div>
-                  <ResponsiveContainer width="100%" height={100}>
-                    <BarChart data={driverData} layout="vertical" barSize={14}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0"/>
-                      <XAxis type="number" tick={{fontSize:10,fill:"#6b7280"}}/>
-                      <YAxis dataKey="family" type="category" width={90} tick={{fontSize:10,fill:"#6b7280"}}/>
-                      <Tooltip contentStyle={{fontSize:11,padding:"4px 10px",border:"1px solid #e5e7eb",borderRadius:"4px"}}/>
-                      <Bar dataKey="count" fill="#D97706" radius={[0,2,2,0]} name="Portfolios"/>
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-                <div className="bg-white border border-gray-200 rounded p-3">
-                  <div className="flex items-center gap-2 mb-2"><Bot size={12} className="text-[#0D7A8A]"/><span className="text-xs font-semibold text-[#0D7A8A]">AI analysis</span><span className="text-[9px] bg-amber-50 text-amber-600 border border-amber-200 px-1 py-px rounded ml-auto">Human review required</span></div>
-                  <p className="text-xs text-gray-700 leading-relaxed">Draft primarily weakens Moderate CIP portfolios with allocation gaps above revised SAA threshold or underweight to house-view OW classes.</p>
-                  <button onClick={()=>go("maker-submit")} className="mt-3 w-full text-xs bg-[#1E3A6B] text-white rounded py-1.5 hover:bg-[#163059]">Submit for Review →</button>
-                </div>
-              </div>
-            </div>
-          </>
-        )}
-        {tab==="Changed Scenarios"&&(
-          <div className="bg-white border border-gray-200 rounded overflow-hidden">
-            <div className="px-4 py-3 border-b border-gray-200 flex items-center gap-3"><span className="text-sm font-semibold text-gray-900">Changed Scenarios</span><span className="text-xs bg-red-50 text-red-600 border border-red-200 px-2 py-0.5 rounded">312 portfolios</span></div>
-            <table className="w-full text-xs"><thead className="bg-gray-50"><tr>{["Segment","CIP","AUM Band","Active","Draft","Driving Rule","Reason Code","Status"].map(h=><th key={h} className="px-3 py-2 text-left font-medium text-gray-500 border-b border-gray-200 whitespace-nowrap">{h}</th>)}</tr></thead>
-              <tbody className="divide-y divide-gray-100">
-                {scenarios.map((s,i)=>(
-                  <tr key={i} className="hover:bg-gray-50">
-                    <td className="px-3 py-2">{s.seg}</td><td className="px-3 py-2">{s.cip}</td><td className="px-3 py-2">{s.aum}</td>
-                    <td className="px-3 py-2 font-bold text-amber-600">{s.ar}</td><td className="px-3 py-2 font-bold text-red-600">{s.dr} ↑</td>
-                    <td className="px-3 py-2">{s.driver}</td><td className="px-3 py-2 font-mono text-gray-500">{s.rc}</td>
-                    <td className="px-3 py-2"><StatusBadge status="Pending Checker Approval" size="xs"/></td>
-                  </tr>
-                ))}
-                <tr className="bg-gray-50"><td colSpan={8} className="px-3 py-2 text-gray-400 text-center italic">+ 307 more rows</td></tr>
-              </tbody>
-            </table>
-          </div>
-        )}
-        {tab==="Rule Contribution"&&<div className="flex items-center justify-center h-48 text-gray-400 text-sm">Rule Contribution analysis</div>}
       </div>
     </div>
   );
@@ -2299,36 +2940,58 @@ function CheckerReview({ go }:{ go:(s:Screen)=>void }) {
 
 function ReleaseCenter({ go }:{ go:(s:Screen)=>void }) {
   const [env,setEnv]=useState("Production");
-  const releases=[
-    {name:"Portfolio Strength Rating",ver:"v4.8",status:"Approved - Awaiting Scheduled Activation",env:"Production",activation:"16 Jun 2026 02:00 SGT",by:"David Lim",src:"AI-Assisted, Human Approved",sel:true},
-    {name:"Investment Idea Suitability",ver:"v3.0",status:"Deployed",env:"UAT",activation:"10 Jun 2026",by:"Sarah Chen",src:"Manual",sel:false},
+  const releasesByEnv:Record<string,Array<{name:string;ver:string;status:string;activation:string;maker:string;checker:string;sel:boolean}>>={
+    Development:[
+      {name:"Portfolio Strength Rating",ver:"v4.9-dev",status:"Pending Checker Approval",activation:"Immediate after approval",maker:"Jennifer Wong",checker:"David Lim",sel:true},
+      {name:"Investment Idea Suitability",ver:"v3.0-dev",status:"Active",activation:"18 Jun 2026 11:15 SGT",maker:"Amir Tan",checker:"Sarah Chen",sel:false},
+    ],
+    UAT:[
+      {name:"Portfolio Strength Rating",ver:"v4.8-uat",status:"Approved - Awaiting Scheduled Activation",activation:"22 Jun 2026 09:00 SGT",maker:"Jennifer Wong",checker:"David Lim",sel:true},
+      {name:"Investment Idea Suitability",ver:"v3.0-uat",status:"Active",activation:"10 Jun 2026 14:00 SGT",maker:"Amir Tan",checker:"Sarah Chen",sel:false},
+    ],
+    Production:[
+      {name:"Portfolio Strength Rating",ver:"v4.8",status:"Approved - Awaiting Scheduled Activation",activation:"16 Jun 2026 02:00 SGT",maker:"Jennifer Wong",checker:"David Lim",sel:true},
+      {name:"Investment Idea Suitability",ver:"v2.9",status:"Active",activation:"08 Jun 2026 01:30 SGT",maker:"Amir Tan",checker:"Sarah Chen",sel:false},
+    ],
+  };
+  const releases=releasesByEnv[env];
+  const envCopy:Record<string,string>={
+    Development:"Separate development instance. Maker-checker approval can activate immediately or on an effective date.",
+    UAT:"Separate UAT instance. Releases are approved and activated here independently; there is no direct UAT-to-Production deployment.",
+    Production:"Separate production instance. Production follows maker approval, checker approval, then immediate activation or effective-date activation.",
+  };
+  const lifecycle=[
+    "Draft",
+    "Maker Submitted",
+    "Checker Approved",
+    "Effective Date Set",
+    "Active",
   ];
-  const lifecycle=["Draft","Pending Approval","Approved","Scheduled","Active","Retired"];
   return (
     <div className="flex flex-col h-full bg-[#F1F4F8]">
       <div className="bg-white border-b border-gray-200 px-6 py-4">
         <div className="flex items-start justify-between mb-3">
-          <div><h1 className="text-lg font-semibold text-gray-900">Release Center</h1><p className="text-xs text-gray-500 mt-0.5">Schedule, activate, monitor and roll back approved rule versions.</p></div>
+          <div><h1 className="text-lg font-semibold text-gray-900">Release Center</h1><p className="text-xs text-gray-500 mt-0.5">{envCopy[env]}</p></div>
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-0.5 bg-gray-100 rounded p-0.5">
               {["Development","UAT","Production"].map(e=><button key={e} onClick={()=>setEnv(e)} className={`px-3 py-1 rounded text-xs font-medium transition-colors ${env===e?"bg-white shadow-sm text-gray-900":"text-gray-500 hover:text-gray-700"}`}>{e}</button>)}
             </div>
-            <Btn icon={Rocket} label="Schedule Approved Release" primary/>
+            <Btn icon={Rocket} label="Set Effective Date" primary/>
           </div>
         </div>
-        <GovernanceBanner text="myWealth Decision Assistant cannot activate or deploy decisions. Release actions require authorized operational users and approved evidence."/>
+        <GovernanceBanner text="Each environment has its own maker-checker release lane. UAT approval does not deploy to Production; Production requires its own maker and checker approval evidence."/>
       </div>
       <div className="bg-white border-b border-gray-200 overflow-auto" style={{maxHeight:"160px"}}>
         <table className="w-full text-xs min-w-[700px]">
-          <thead className="bg-gray-50 sticky top-0"><tr>{["Decision","Version","Status","Environment","Activation","Approved By","Source",""].map(h=><th key={h} className="px-3 py-2 text-left font-medium text-gray-500 border-b border-gray-200 whitespace-nowrap">{h}</th>)}</tr></thead>
+          <thead className="bg-gray-50 sticky top-0"><tr>{["Decision","Version","Status","Environment","Activation","Maker","Checker",""].map(h=><th key={h} className="px-3 py-2 text-left font-medium text-gray-500 border-b border-gray-200 whitespace-nowrap">{h}</th>)}</tr></thead>
           <tbody className="divide-y divide-gray-100">
             {releases.map((r,i)=>(
               <tr key={i} className={`cursor-pointer ${r.sel?"bg-blue-50":"hover:bg-gray-50"}`}>
                 <td className="px-3 py-2.5 font-medium text-[#1E3A6B]">{r.name}</td>
                 <td className="px-3 py-2.5 font-mono">{r.ver}</td>
                 <td className="px-3 py-2.5"><StatusBadge status={r.status} size="xs"/></td>
-                <td className="px-3 py-2.5 text-gray-600">{r.env}</td><td className="px-3 py-2.5 text-gray-600">{r.activation}</td>
-                <td className="px-3 py-2.5 text-gray-600">{r.by}</td><td className="px-3 py-2.5 text-gray-500">{r.src}</td>
+                <td className="px-3 py-2.5 text-gray-600">{env}</td><td className="px-3 py-2.5 text-gray-600">{r.activation}</td>
+                <td className="px-3 py-2.5 text-gray-600">{r.maker}</td><td className="px-3 py-2.5 text-gray-600">{r.checker}</td>
                 <td className="px-3 py-2.5"><button className="text-gray-400 hover:text-gray-600"><MoreHorizontal size={13}/></button></td>
               </tr>
             ))}
@@ -2339,19 +3002,19 @@ function ReleaseCenter({ go }:{ go:(s:Screen)=>void }) {
         <div className="grid grid-cols-3 gap-4">
           <div className="col-span-2 bg-white border border-gray-200 rounded p-4">
             <div className="flex items-center justify-between mb-4">
-              <div><div className="text-sm font-semibold text-gray-900">Portfolio Strength Rating</div><code className="font-mono text-xs text-gray-500">PS · Approved candidate</code></div>
+              <div><div className="text-sm font-semibold text-gray-900">Portfolio Strength Rating</div><code className="font-mono text-xs text-gray-500">PS · {env} release lane</code></div>
               <div className="flex items-center gap-2"><code className="font-mono text-base font-bold text-amber-700">v4.8</code><StatusBadge status="Approved - Awaiting Scheduled Activation" size="xs"/></div>
             </div>
             <div className="flex gap-0 mb-5">
               {lifecycle.map((stage,i)=>(
                 <div key={stage} className="flex-1 flex flex-col items-center">
-                  <div className={`w-full h-1.5 ${i===0?"rounded-l":""} ${i===lifecycle.length-1?"rounded-r":""} ${i<=2?"bg-[#1E3A6B]":"bg-gray-200"}`}/>
-                  <div className={`text-[9px] mt-1.5 font-medium text-center ${i===2?"text-[#1E3A6B]":i<2?"text-gray-400":"text-gray-300"}`}>{stage}</div>
+                  <div className={`w-full h-1.5 ${i===0?"rounded-l":""} ${i===lifecycle.length-1?"rounded-r":""} ${i<=3?"bg-[#1E3A6B]":"bg-gray-200"}`}/>
+                  <div className={`text-[9px] mt-1.5 font-medium text-center ${i===3?"text-[#1E3A6B]":i<3?"text-gray-400":"text-gray-300"}`}>{stage}</div>
                 </div>
               ))}
             </div>
             <div className="grid grid-cols-2 gap-x-8 gap-y-3 text-xs">
-              {[["Artifact Checksum","sha256:a4b2c1…"],["Maker","Jennifer Wong"],["Checker","David Lim · Advisory Compliance"],["Origin","AI-Assisted, Human Approved"],["Activation","Scheduled"],["Rollback Target","v4.7 (currently active)"]].map(([k,v])=>(
+              {[["Artifact Checksum","sha256:a4b2c1..."],["Maker","Jennifer Wong"],["Checker","David Lim · Advisory Compliance"],["Environment",env],["Activation Option","Immediate or effective date"],["Rollback Target",env==="Production"?"v4.7 (currently active)":"previous active in same instance"]].map(([k,v])=>(
                 <div key={k}><div className="text-gray-500">{k}</div><div className={`font-medium text-gray-900 mt-0.5 ${k==="Artifact Checksum"?"font-mono text-[10px] text-gray-600":""}`}>{v}</div></div>
               ))}
             </div>
@@ -2360,13 +3023,14 @@ function ReleaseCenter({ go }:{ go:(s:Screen)=>void }) {
             <div className="bg-white border border-gray-200 rounded p-4">
               <div className="text-sm font-semibold text-gray-900 mb-3">Release Actions</div>
               <div className="space-y-2">
-                <button className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059]"><Rocket size={12}/>Schedule Activation</button>
+                <button className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059]"><Rocket size={12}/>Release Immediately</button>
+                <button className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50"><Clock size={12}/>Set Effective Date</button>
                 <button className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50"><Eye size={12}/>Preview Release Notes</button>
-                <button className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50"><History size={12}/>Rollback to v4.7</button>
+                <button className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50"><History size={12}/>Rollback Same Instance</button>
                 <button onClick={()=>go("trace")} className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50"><Eye size={12}/>View Decision Trace</button>
               </div>
             </div>
-            <div className="bg-amber-50 border border-amber-200 rounded p-3"><div className="flex items-start gap-2"><Clock size={12} className="text-amber-600 flex-shrink-0 mt-0.5"/><div><div className="text-xs font-semibold text-amber-700">Scheduled</div><div className="text-xs text-amber-600 mt-0.5">16 Jun 2026 · 02:00 SGT</div></div></div></div>
+            <div className="bg-amber-50 border border-amber-200 rounded p-3"><div className="flex items-start gap-2"><Clock size={12} className="text-amber-600 flex-shrink-0 mt-0.5"/><div><div className="text-xs font-semibold text-amber-700">Effective date mode</div><div className="text-xs text-amber-600 mt-0.5">Activation occurs only within the selected {env} instance.</div></div></div></div>
           </div>
         </div>
       </div>
@@ -2499,11 +3163,21 @@ function MyDrafts({ go, setStudioFn }:{ go:(s:Screen)=>void; setStudioFn:(k:stri
 }
 
 function PlatformSettings() {
+  const sections=[
+    {title:"Environment Instances",items:["Development instance · Isolated rules and reference data","UAT instance · Isolated approval and test evidence","Production instance · Separate maker-checker release lane"]},
+    {title:"User Access & Roles",items:["Jennifer Wong · Maker","David Lim · Checker","Sarah Chen · Checker","Release Operator · Production activation"]},
+    {title:"Maker-Checker Policy",items:["Tier 1 decisions require maker attestation","Checker approval required per environment","Production cannot reuse UAT approval as release approval"]},
+    {title:"AI Workspace Configuration",items:["Draft Decision API · Enabled","Backend AI conversion · Enabled","Approval and release APIs · Disabled for AI"]},
+    {title:"Regression Test Library",items:["Historical test case repository","Boundary case suite ownership","Expected-result re-baseline approvals"]},
+    {title:"Release Governance",items:["Immediate release allowed after checker approval","Effective-date release allowed with date and time","Rollback limited to selected environment instance"]},
+    {title:"Audit & Trace Settings",items:["Immutable approval evidence retention","Decision trace masking defaults","Exportable evidence pack configuration"]},
+    {title:"Reference Data Controls",items:["CIP bands and house view source mapping","Reason-code registry","Rule input/output contract registry"]},
+  ];
   return (
     <div className="flex flex-col h-full bg-[#F1F4F8]">
-      <div className="bg-white border-b border-gray-200 px-6 py-4"><h1 className="text-lg font-semibold text-gray-900">Platform Settings</h1></div>
-      <div className="flex-1 overflow-y-auto p-6"><div className="max-w-xl space-y-4">
-        {[{title:"Environments",items:["Development · Active","UAT · Active","Production · Active"]},{title:"User Access & Roles",items:["Jennifer Wong · Maker","David Lim · Checker","Sarah Chen · Checker"]},{title:"AI Workspace Configuration",items:["Draft Decision API · Enabled","Approval API · Disabled (by policy)"]},{title:"Release Governance",items:["Tier 1 decisions require Checker approval","Auto-rollback on health failure · Enabled"]}].map(s=>(
+      <div className="bg-white border-b border-gray-200 px-6 py-4"><h1 className="text-lg font-semibold text-gray-900">Platform Settings</h1><p className="text-xs text-gray-500 mt-0.5">Configuration areas required for controlled authoring, testing, release and audit.</p></div>
+      <div className="flex-1 overflow-y-auto p-6"><div className="grid grid-cols-2 gap-4 max-w-5xl">
+        {sections.map(s=>(
           <div key={s.title} className="bg-white border border-gray-200 rounded">
             <div className="px-5 py-3.5 border-b border-gray-200 text-sm font-semibold text-gray-900">{s.title}</div>
             <div className="px-5 py-3">{s.items.map(item=>(
@@ -2519,24 +3193,57 @@ function PlatformSettings() {
 // ─── Root App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [screen,   setScreen]   = useState<Screen>("catalog");
+  const [screen,   setScreen]   = useState<Screen>("studio");
   const [studioFn, setStudioFn] = useState("PS");
+  const [assistantContext, setAssistantContext] = useState<AssistantContext|null>(null);
 
-  const go = (s:Screen) => setScreen(s);
+  const go = (s:Screen) => {
+    if (s !== "ai-works") setAssistantContext(null);
+    setScreen(s);
+  };
+
+  const askRuleAssistant = (rule: Rule) => {
+    setAssistantContext({
+      source: "rule",
+      ruleId: rule.id,
+      ruleName: rule.name,
+      ruleType: rule.type,
+      prompt: [
+        `Review the ${rule.name} rule (${rule.id}) in Decision Studio.`,
+        "Explain the current logic, identify the input and output contract, and prepare maker-editable draft notes.",
+        "Do not approve, activate, deploy, or call a backend service.",
+      ].join(" "),
+    });
+    setScreen("ai-works");
+  };
+
+  const askFunctionAssistant = (fn: RuleFunctionDef) => {
+    setAssistantContext({
+      source: "function",
+      ruleId: fn.key,
+      ruleName: fn.name,
+      ruleType: "RuleFunction",
+      prompt: [
+        `Review the ${fn.name} rule function (${fn.key}) in Decision Studio.`,
+        `Active release is ${fn.activeRelease}${fn.draftRelease ? ` with draft ${fn.draftRelease}` : ""}.`,
+        "Explain the current rule flow, I/O contract, test coverage, simulation evidence, and release readiness.",
+        "Prepare maker-editable improvement notes. Do not approve, activate, deploy, or call a backend service.",
+      ].join(" "),
+    });
+    setScreen("ai-works");
+  };
 
   const render = () => {
     switch (screen) {
-      case "catalog":      return <DecisionCatalog  go={go} setStudioFn={setStudioFn}/>;
-      case "studio":       return <DecisionStudio   fnKey={studioFn} setFnKey={setStudioFn} go={go}/>;
-      case "ai-works":     return <AIWorksScreen    go={go}/>;
-      case "simulation":   return <SimulationLab    go={go}/>;
+      case "studio":       return <DecisionStudio   fnKey={studioFn} setFnKey={setStudioFn} go={go} onAskRuleAssistant={askRuleAssistant} onAskFunctionAssistant={askFunctionAssistant}/>;
+      case "ai-works":     return <AIWorksScreen    go={go} assistantContext={assistantContext}/>;
       case "drafts":       return <MyDrafts         go={go} setStudioFn={setStudioFn}/>;
       case "review-queue": return <CheckerReview    go={go}/>;
       case "release":      return <ReleaseCenter    go={go}/>;
       case "trace":        return <DecisionTrace/>;
       case "settings":     return <PlatformSettings/>;
       case "maker-submit": return <MakerSubmit      go={go}/>;
-      default:             return <DecisionCatalog  go={go} setStudioFn={setStudioFn}/>;
+      default:             return <DecisionStudio   fnKey={studioFn} setFnKey={setStudioFn} go={go} onAskRuleAssistant={askRuleAssistant} onAskFunctionAssistant={askFunctionAssistant}/>;
     }
   };
 
