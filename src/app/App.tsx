@@ -559,7 +559,7 @@ function buildRuleFunctionExecutionSpec(fn: RuleFunctionDef, allRules: Rule[]) {
   const fnRules = fn.ruleIds.map(id=>allRules.find(r=>r.id===id)).filter(Boolean) as Rule[];
   const flowOverride = (ruleId: string) => fn.flowOverrides?.[ruleId] ?? {};
 
-  if (fn.key === "PS") {
+  if (fn.key === "PS" || fn.weights) {
     const exceptionRule = fnRules.find(r=>r.id==="R-NTW-001");
     const scoringRules = fnRules.filter(r=>r.type!=="WeightedAggregation" && r.id!=="R-NTW-001");
     const exceptionOverride = exceptionRule ? flowOverride(exceptionRule.id) : {};
@@ -630,8 +630,8 @@ function buildRuleFunctionExecutionSpec(fn: RuleFunctionDef, allRules: Rule[]) {
         outputMap: rule.outputs.map(o=>o.name),
       })),
       aggregation: {
-        nodeId: "NODE-R-OVERALL-001",
-        ruleId: "R-OVERALL-001",
+        nodeId: `NODE-${fnRules.find(r=>r.type==="WeightedAggregation")?.id ?? "R-OVERALL-001"}`,
+        ruleId: fnRules.find(r=>r.type==="WeightedAggregation")?.id ?? "R-OVERALL-001",
         strategy: "WEIGHTED_AGGREGATION",
         skipStatuses: ["SKIPPED"],
         rounding: "ceiling",
@@ -640,6 +640,48 @@ function buildRuleFunctionExecutionSpec(fn: RuleFunctionDef, allRules: Rule[]) {
       terminalOutput: ["overallRating","weightedScore","activeWeight","reasonCodes"],
       governance: {
         requiresMakerReview: Boolean(fn.draftRelease),
+        requiresCheckerApproval: true,
+        executableBy: "JAVA_BACKEND_ONLY",
+      },
+    };
+  }
+
+  if (fn.key !== "II") {
+    return {
+      schemaVersion: "1.0",
+      functionKey: fn.key,
+      functionName: fn.name,
+      executionType: "SEQUENTIAL_RULE_FLOW",
+      javaHandler: "RuleFunctionExecutionEngine.executeRuleFlow",
+      inputContract: Array.from(new Map(fnRules.flatMap(r=>r.inputs).map(f=>[f.name, {
+        name:f.name, type:f.type, required:f.required, description:f.desc,
+      }])).values()),
+      customConditionNodes: (fn.conditionSteps ?? []).map(step=>({
+        nodeId: step.id,
+        nodeType: "CUSTOM_CONDITION",
+        name: step.name,
+        condition: { expression: step.condition },
+        onTrue: { flowId: step.trueFlowId, displayLabel: step.trueLabel },
+        onFalse: { flowId: step.falseFlowId, displayLabel: step.falseLabel },
+        makerNote: step.note ?? null,
+      })),
+      flows: [
+        { flowId:"DRAFT_SEQUENTIAL_FLOW", type:"SEQUENTIAL", startsAt: fnRules[0] ? `NODE-${fnRules[0].id}` : null },
+        { flowId:"MANUAL_REVIEW_FLOW", type:"TERMINAL", terminal:"MANUAL_REVIEW" },
+      ],
+      nodes: fnRules.map((rule, index)=>({
+        nodeId: `NODE-${rule.id}`,
+        ruleId: rule.id,
+        ruleType: rule.type,
+        execution: "SEQUENTIAL",
+        sequence: index + 1,
+        editNote: flowOverride(rule.id).note ?? null,
+        nextNodeId: fnRules[index + 1] ? `NODE-${fnRules[index + 1].id}` : null,
+        outputMap: rule.outputs.map(o=>o.name),
+      })),
+      terminalOutput: Array.from(new Set(fnRules.slice(-1).flatMap(rule=>rule.outputs.map(o=>o.name)))),
+      governance: {
+        requiresMakerReview: true,
         requiresCheckerApproval: true,
         executableBy: "JAVA_BACKEND_ONLY",
       },
@@ -730,7 +772,7 @@ function buildRuleFunctionExecutionSpec(fn: RuleFunctionDef, allRules: Rule[]) {
 
 const NAV_ITEMS = [
   { id:"studio",       label:"Decision Studio",    icon:Layers,        badge:null,                badgeCls:"" },
-  { id:"ai-works",     label:"AI Works",           icon:Wand2,         badge:null,                badgeCls:"" },
+  { id:"ai-works",     label:"AI - Create Rule",   icon:Wand2,         badge:null,                badgeCls:"" },
   { id:"drafts",       label:"My Drafts",          icon:FolderOpen,    badge:"4",                 badgeCls:"bg-amber-500" },
   { id:"review-queue", label:"Review Queue",       icon:ClipboardCheck,badge:"12",                badgeCls:"bg-blue-600" },
   { id:"release",      label:"Release Center",     icon:Rocket,        badge:null,                badgeCls:"" },
@@ -1790,12 +1832,56 @@ function IIDecisionTree({ rules }: { rules: Rule[] }) {
 }
 
 /** Dispatcher: picks the right tree view for the function */
+function GenericFunctionTree({ fn, rules }: { fn: RuleFunctionDef; rules: Rule[] }) {
+  return (
+    <div className="p-6 min-w-[760px]">
+      <div className="flex flex-col items-center">
+        <TreeBox variant="input" tag="Input" label={fn.name}
+          sublabel="Auto-derived input contract from selected rule membership" />
+        <TreeConnector label={fn.weights ? "parallel weighted flow" : "sequential flow"} />
+
+        <div className={`${fn.weights ? "grid grid-cols-2 gap-3 max-w-3xl" : "flex flex-col items-center gap-0"} w-full`}>
+          {rules.map((rule, index)=>(
+            <div key={rule.id} className={fn.weights ? "" : "flex flex-col items-center"}>
+              <TreeBox
+                variant={rule.modified ? "condition" : "rule"}
+                tag={rule.type}
+                label={rule.name}
+                sublabel={`${rule.id}${fn.weights?.[rule.id] ? ` · weight ${fn.weights[rule.id]}%` : ""}`}
+              />
+              {!fn.weights && index < rules.length - 1 && <TreeConnector label="next" />}
+            </div>
+          ))}
+        </div>
+
+        {(fn.conditionSteps ?? []).length > 0 && (
+          <>
+            <TreeConnector label="maker review gate" />
+            {(fn.conditionSteps ?? []).map(step=>(
+              <div key={step.id} className="w-full max-w-2xl">
+                <div className="grid grid-cols-2 gap-6">
+                  <BranchOutcome label="TRUE" title={step.trueFlowId} detail={step.trueLabel} variant="pass" />
+                  <BranchOutcome label="FALSE" title={step.falseFlowId} detail={step.falseLabel} variant="warn" />
+                </div>
+              </div>
+            ))}
+          </>
+        )}
+
+        <TreeConnector label="terminal output" />
+        <TreeBox variant="output" tag="Output" label="Function Output"
+          sublabel={rules.slice(-1).flatMap(rule=>rule.outputs.map(output=>output.name)).join(" · ") || "Derived output contract"} />
+      </div>
+    </div>
+  );
+}
+
 function DecisionTreeView({ fn, allRules }: { fn: RuleFunctionDef; allRules: Rule[] }) {
   const fnRules = fn.ruleIds.map(id => allRules.find(r => r.id === id)).filter(Boolean) as Rule[];
   return (
     <div className="flex flex-col h-full overflow-hidden">
       <div className="flex-1 min-h-0 overflow-auto bg-[#F1F4F8]">
-        {fn.key === "PS" ? <PSDecisionTree fn={fn} rules={fnRules} /> : <IIDecisionTree rules={fnRules} />}
+        {fn.key === "PS" || fn.weights ? <PSDecisionTree fn={fn} rules={fnRules} /> : fn.key === "II" ? <IIDecisionTree rules={fnRules} /> : <GenericFunctionTree fn={fn} rules={fnRules} />}
       </div>
       <div className="border-t border-gray-200 bg-white p-3 flex-shrink-0">
         <FunctionExecutionJsonPanel fn={fn} allRules={allRules} compact/>
@@ -2950,44 +3036,19 @@ function RuleFunctionView({ fn, setFn, allRules, testCases, onSaveTestCase, onDe
   );
 }
 
-// ─── AI Works Screen ──────────────────────────────────────────────────────────
+// ─── Create Rule Screen ───────────────────────────────────────────────────────
 
 type AIWorksStep = { type: "read"|"analyze"|"create"|"validate"|"write"; label: string; status: "pending"|"running"|"done"|"write-done" };
 type AIWorksPhase = "idle"|"running"|"done";
 
-const CREATION_STEPS: AIWorksStep[] = [
-  { type:"read",     label:"Loading existing rule library and function catalog",           status:"pending" },
-  { type:"analyze",  label:"Identifying required rule families from description",          status:"pending" },
-  { type:"create",   label:"Generating ESG Score rule — ScoringMatrix (0–100 → Rating 1–5)", status:"pending" },
-  { type:"create",   label:"Generating Green Allocation rule — ThresholdMatrix by CIP",   status:"pending" },
-  { type:"create",   label:"Generating Controversial Sector rule — ExclusionList",        status:"pending" },
-  { type:"validate", label:"Validating rule logic and I/O compatibility",                  status:"pending" },
-  { type:"create",   label:"Auto-generating I/O contract from rule combination",           status:"pending" },
-  { type:"create",   label:"Generating 6 boundary and regression test cases",              status:"pending" },
-  { type:"write",    label:"Calling Draft Function API — creating SUSTAIN-CHECK-003 as maker-owned draft", status:"pending" },
+const CREATE_RULE_STEPS: AIWorksStep[] = [
+  { type:"read",     label:"Reading maker-entered rule logic text", status:"pending" },
+  { type:"analyze",  label:"Inferring rule type, input fields, output fields and reason-code pattern", status:"pending" },
+  { type:"create",   label:"Creating draft rule metadata and I/O contract", status:"pending" },
+  { type:"create",   label:"Converting rule logic into AI Structured JSON", status:"pending" },
+  { type:"validate", label:"Checking structured JSON envelope, contracts and data-only execution safety", status:"pending" },
+  { type:"write",    label:"Preparing maker-owned draft rule for the local Rule Library", status:"pending" },
 ];
-
-function getRuleAssistantSteps(context: AssistantContext): AIWorksStep[] {
-  if (context.source === "function") {
-    return [
-      { type:"read",     label:`Loading ${context.ruleId} from the Decision Studio rule function workspace`, status:"pending" },
-      { type:"analyze",  label:"Reviewing rule flow, I/O contract, tests and simulation evidence", status:"pending" },
-      { type:"analyze",  label:`Checking draft status, regression coverage and release readiness for ${context.ruleName}`, status:"pending" },
-      { type:"create",   label:"Preparing maker-editable improvement notes for the rule function", status:"pending" },
-      { type:"validate", label:"Checking recommendations against current frontend rule composition", status:"pending" },
-      { type:"write",    label:"Saving assistant recommendations in the prototype workspace only", status:"pending" },
-    ];
-  }
-
-  return [
-    { type:"read",     label:`Loading ${context.ruleId} from the Decision Studio rule library`, status:"pending" },
-    { type:"analyze",  label:`Interpreting ${context.ruleType} logic and current output contract`, status:"pending" },
-    { type:"analyze",  label:`Checking inputs, outputs and reason-code traceability for ${context.ruleName}`, status:"pending" },
-    { type:"create",   label:"Preparing maker-editable draft notes for the selected rule", status:"pending" },
-    { type:"validate", label:"Checking draft notes against the existing frontend I/O contract", status:"pending" },
-    { type:"write",    label:"Saving assistant recommendations in the prototype workspace only", status:"pending" },
-  ];
-}
 
 const STEP_CLS: Record<string, string> = {
   read:     "bg-blue-50 text-blue-700 border border-blue-200",
@@ -2997,27 +3058,40 @@ const STEP_CLS: Record<string, string> = {
   write:    "bg-orange-100 text-orange-800 border border-orange-300",
 };
 
-function AIWorksScreen({ go, assistantContext }: { go: (s: Screen) => void; assistantContext?: AssistantContext|null }) {
-  const [input, setInput]     = useState("");
-  const [conversationPrompt, setConversationPrompt] = useState("");
-  const [phase, setPhase]     = useState<AIWorksPhase>("idle");
-  const [steps, setSteps]     = useState<AIWorksStep[]>([]);
-  const [draftReady, setDraftReady] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const timerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
+function AIWorksScreen({
+  go, assistantContext, localRules, onCreateRule,
+}: {
+  go: (s: Screen) => void;
+  assistantContext?: AssistantContext|null;
+  localRules: Rule[];
+  onCreateRule: (rule: Rule, sourceText: string) => Rule;
+}) {
+  const SAMPLE_RULE_TEXT = "Rule Name: High Risk Product Block. If productRiskRating > cipRiskTolerance then eligible = false and reasonCode = RISK-MISMATCH. Otherwise eligible = true and reasonCode = RISK-OK.";
+  const [logicText, setLogicText] = useState(assistantContext?.prompt ?? SAMPLE_RULE_TEXT);
+  const [phase, setPhase] = useState<AIWorksPhase>("idle");
+  const [steps, setSteps] = useState<AIWorksStep[]>([]);
+  const [generatedRule, setGeneratedRule] = useState<Rule|null>(null);
+  const [createdRuleId, setCreatedRuleId] = useState<string|null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const SAMPLE_REQUEST = "Create a Sustainability Suitability Check function for wealth advisory. It should evaluate ESG score, green investment allocation percentage, and controversial sector exposure to determine if a portfolio meets our sustainability policy.";
-  const contextPrompt = assistantContext?.prompt ?? SAMPLE_REQUEST;
+  useEffect(() => {
+    setLogicText(assistantContext?.prompt ?? SAMPLE_RULE_TEXT);
+    setPhase("idle");
+    setSteps([]);
+    setGeneratedRule(null);
+    setCreatedRuleId(null);
+  }, [assistantContext?.ruleId]);
 
-  const runCreation = (userMsg: string) => {
-    if (phase === "running") return;
-    const request = userMsg || contextPrompt;
-    setConversationPrompt(request);
-    setPhase("running");
-    setDraftReady(false);
-    const sourceSteps = assistantContext ? getRuleAssistantSteps(assistantContext) : CREATION_STEPS;
-    const fresh = sourceSteps.map(s => ({ ...s, status: "pending" as const }));
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
+
+  const convertRule = () => {
+    if (!logicText.trim() || phase === "running") return;
+    const nextRule = buildRuleFromLogicText(logicText, localRules.filter(r=>r.id.startsWith("R-AI-")).length + 1);
+    const fresh = CREATE_RULE_STEPS.map(s=>({...s, status:"pending" as const}));
+    setGeneratedRule(null);
+    setCreatedRuleId(null);
     setSteps(fresh);
+    setPhase("running");
 
     fresh.forEach((_, i) => {
       const isLast = i === fresh.length - 1;
@@ -3027,319 +3101,172 @@ function AIWorksScreen({ go, assistantContext }: { go: (s: Screen) => void; assi
           j === i + 1 ? { ...s, status: "running" } : s
         ));
         if (isLast) {
-          setTimeout(() => { setPhase("done"); setDraftReady(true); }, 600);
+          setTimeout(() => {
+            setGeneratedRule(nextRule);
+            setPhase("done");
+          }, 450);
         }
-      }, 700 + i * 900);
+      }, 450 + i * 520);
     });
-
-    // Kick off first step immediately
-    setTimeout(() => setSteps(prev => prev.map((s, j) => j === 0 ? { ...s, status: "running" } : s)), 100);
+    setTimeout(() => setSteps(prev => prev.map((s, j)=>j===0 ? {...s, status:"running"} : s)), 100);
   };
 
-  useEffect(() => {
-    if (!assistantContext) return;
-    setInput(assistantContext.prompt);
-    setConversationPrompt(assistantContext.prompt);
-    setPhase("idle");
-    setSteps([]);
-    setDraftReady(false);
-  }, [assistantContext?.ruleId]);
+  const addToLibrary = () => {
+    if (!generatedRule) return;
+    const saved = onCreateRule(generatedRule, logicText);
+    setCreatedRuleId(saved.id);
+  };
 
-  useEffect(() => { return () => { if (timerRef.current) clearTimeout(timerRef.current); }; }, []);
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [steps, draftReady]);
-
-  const hasConversation = phase !== "idle";
-  const contextLabel = assistantContext?.source === "function" ? "rule function" : "rule";
-  const contextTitle = assistantContext?.source === "function" ? "Rule Function Assistance Preview" : "Rule Assistance Preview";
-  const selectedLabel = assistantContext?.source === "function" ? "Selected Rule Function" : "Selected Rule";
-  const assistantFocus = assistantContext?.source === "function"
-    ? ["Explain current rule-function flow","Review I/O contract and regression coverage","Prepare maker-editable improvement notes","Keep production unchanged"]
-    : ["Explain current rule logic","Review input and output contract","Prepare maker-editable draft notes","Keep production unchanged"];
-  const assistantIntro = assistantContext
-    ? `Understood. I am reviewing ${assistantContext.ruleName} (${assistantContext.ruleId}) in Decision Studio. I will summarize the current ${contextLabel} setup, check its governance evidence, and prepare maker-editable notes without changing production rules.`
-    : "Understood. I identified three rule families for a Sustainability Suitability Check: ESG Score evaluation, Green Allocation threshold check, and Controversial Sector screening. Creating the draft rule function now.";
+  const structuredJson = generatedRule ? JSON.stringify(buildAiStructuredRuleSpec(generatedRule, logicText), null, 2) : "";
+  const canAdd = Boolean(generatedRule) && createdRuleId !== generatedRule?.id;
 
   return (
-    <div className="flex h-full overflow-hidden">
-      {/* Left: conversation */}
-      <div className="flex flex-col overflow-hidden border-r border-gray-200 bg-white" style={{ flex: "0 0 62%" }}>
-        {/* Header */}
+    <div className="flex h-full overflow-hidden bg-[#F1F4F8]">
+      <div className="flex flex-col overflow-hidden border-r border-gray-200 bg-white" style={{ flex:"0 0 42%" }}>
         <div className="px-6 py-4 border-b border-gray-200 flex-shrink-0">
           <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-[#1E3A6B] to-[#0D7A8A] flex items-center justify-center flex-shrink-0">
+            <div className="w-8 h-8 rounded-lg bg-[#1E3A6B] flex items-center justify-center flex-shrink-0">
               <Wand2 size={15} className="text-white" />
             </div>
             <div>
-              <h1 className="text-sm font-semibold text-gray-900">AI Works</h1>
-              <p className="text-[10px] text-gray-400">{assistantContext ? "Contextual assistance from Decision Studio." : "Describe a rule function in plain language. AI Works creates a draft for your review."}</p>
+              <h1 className="text-sm font-semibold text-gray-900">Create Rule</h1>
+              <p className="text-[10px] text-gray-400">Use AI to convert maker-entered rule logic into structured JSON.</p>
             </div>
           </div>
         </div>
 
-        {/* Messages */}
-        <div className="flex-1 overflow-y-auto p-5 space-y-5">
+        <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          <GovernanceBanner text="Create Rule produces maker-owned draft rules only. AI conversion cannot approve, release, or activate rules."/>
 
-          {/* Governance notice */}
-          <div className="flex items-start gap-2 bg-amber-50 border border-amber-200 rounded p-2.5">
-            <Shield size={12} className="text-amber-600 flex-shrink-0 mt-px" />
-            <p className="text-xs text-amber-700 leading-relaxed">
-              AI Works creates rule functions as <strong>maker-owned drafts</strong>. All rules, I/O contracts and test cases require maker review and checker approval before release. AI Works cannot approve, activate or deploy.
-            </p>
-          </div>
-
-          {assistantContext && !hasConversation && (
+          {assistantContext && (
             <div className="bg-blue-50 border border-blue-200 rounded p-3">
-              <div className="flex items-center gap-2 mb-1.5">
+              <div className="flex items-center gap-2 mb-1">
                 <Sparkles size={12} className="text-[#1E3A6B]"/>
                 <span className="text-xs font-semibold text-[#1E3A6B]">Decision Studio context loaded</span>
-                <code className="ml-auto text-[10px] text-blue-700 bg-white/70 border border-blue-100 px-1.5 py-0.5 rounded">{assistantContext.ruleId}</code>
               </div>
               <p className="text-xs text-blue-900 leading-relaxed">
-                The assistant is ready to review <strong>{assistantContext.ruleName}</strong>, explain its {contextLabel} setup, and prepare frontend-only notes for maker review.
+                Starting from {assistantContext.ruleName} ({assistantContext.ruleId}). Edit the text below, then convert it into a new draft rule.
               </p>
             </div>
           )}
 
-          {/* If no conversation yet, show capability cards */}
-          {!hasConversation && !assistantContext && (
-            <div className="space-y-3">
-              <p className="text-xs text-gray-500 text-center">Tell AI Works what rule function you need — describe the business objective in plain language.</p>
-              <div className="grid grid-cols-2 gap-2">
-                {[
-                  { title:"Portfolio health check",  desc:"Create a scoring function that evaluates cash, returns and SAA alignment for a portfolio strength rating" },
-                  { title:"Product suitability",     desc:"Build an eligibility and recommendation ranking function for investment ideas based on CIP and risk profile" },
-                  { title:"Sustainability screen",   desc:"Define rules to check ESG score, green allocation and controversial sector exposure against policy" },
-                  { title:"Fee discount logic",      desc:"Create an eligibility function for advisory fee discounts based on AUM, tenure and product mix" },
-                ].map(c => (
-                  <button key={c.title} onClick={() => setInput(c.desc)}
-                    className="text-left bg-gray-50 border border-gray-200 rounded-lg p-3 hover:border-[#1E3A6B] hover:bg-blue-50 transition-colors">
-                    <div className="text-xs font-semibold text-gray-800 mb-1">{c.title}</div>
-                    <div className="text-[10px] text-gray-500 leading-relaxed">{c.desc}</div>
-                  </button>
+          <div>
+            <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Rule Logic Text</label>
+            <textarea
+              value={logicText}
+              onChange={e=>{ setLogicText(e.target.value); setGeneratedRule(null); setCreatedRuleId(null); setPhase("idle"); setSteps([]); }}
+              rows={13}
+              className="w-full border border-gray-200 rounded px-3 py-2 text-xs leading-relaxed resize-y outline-none focus:border-[#1E3A6B]"
+              placeholder={SAMPLE_RULE_TEXT}
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            {[
+              { title:"Risk block", text:"Rule Name: Product Risk Eligibility. If productRiskRating > clientRiskTolerance then eligible = false and reasonCode = RISK-BLOCK. Otherwise eligible = true." },
+              { title:"Concentration warning", text:"Rule Name: Holding Concentration Warning. If holdingConcentration > 25 then warning = true and reasonCode = CONCENTRATION-WARN. Otherwise warning = false." },
+              { title:"ESG score", text:"Rule Name: ESG Score Rating. If esgScore >= 80 then rating = 1. If esgScore >= 60 then rating = 3. Otherwise rating = 5." },
+              { title:"Restricted product", text:"Rule Name: Restricted Product Check. If restrictedFlags contains PRODUCT_BLOCKED then restricted = true and reasonCode = PRODUCT-BLOCKED. Otherwise restricted = false." },
+            ].map(sample=>(
+              <button key={sample.title} onClick={()=>setLogicText(sample.text)}
+                className="text-left bg-gray-50 border border-gray-200 rounded p-2.5 hover:border-[#1E3A6B] hover:bg-blue-50 transition-colors">
+                <div className="text-xs font-semibold text-gray-800">{sample.title}</div>
+                <div className="text-[10px] text-gray-500 mt-0.5 line-clamp-2">{sample.text}</div>
+              </button>
+            ))}
+          </div>
+
+          <button onClick={convertRule} disabled={!logicText.trim() || phase==="running"}
+            className="w-full flex items-center justify-center gap-1.5 px-4 py-2.5 bg-[#1E3A6B] text-white rounded text-xs font-semibold hover:bg-[#163059] disabled:opacity-50">
+            {phase === "running" ? <RefreshCw size={12} className="animate-spin"/> : <Wand2 size={12}/>}
+            {phase === "running" ? "Converting..." : "Convert to AI Structured JSON"}
+          </button>
+
+          {steps.length > 0 && (
+            <div className="border border-gray-200 rounded overflow-hidden">
+              <div className="px-3 py-2 bg-gray-50 border-b border-gray-200 text-xs font-semibold text-gray-700">Conversion Record</div>
+              <div className="p-2 space-y-1">
+                {steps.map((s,i)=>(
+                  <div key={i} className={`flex items-center gap-2 px-2 py-1.5 rounded ${s.status==="write-done"?"bg-orange-50 border border-orange-200":s.status==="done"?"bg-gray-50":s.status==="running"?"bg-blue-50":"opacity-40"}`}>
+                    <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase flex-shrink-0 ${STEP_CLS[s.type]}`}>{s.type}</span>
+                    <span className="text-xs text-gray-700 flex-1">{s.label}</span>
+                    {s.status==="running" && <RefreshCw size={10} className="text-blue-600 animate-spin"/>}
+                    {(s.status==="done" || s.status==="write-done") && <CheckCircle2 size={10} className="text-green-600"/>}
+                  </div>
                 ))}
               </div>
             </div>
           )}
-
-          {/* User message */}
-          {hasConversation && (
-            <div className="flex items-start gap-3">
-              <div className="w-7 h-7 rounded-full bg-[#1E3A6B] flex items-center justify-center text-white text-xs font-bold flex-shrink-0">JW</div>
-              <div className="flex-1 bg-[#F1F4F8] rounded-lg p-3">
-                <div className="text-[10px] font-semibold text-gray-500 mb-1">Jennifer Wong · Maker</div>
-                <p className="text-xs text-gray-800 leading-relaxed">{conversationPrompt || contextPrompt}</p>
-              </div>
-            </div>
-          )}
-
-          {/* AI Works response */}
-          {hasConversation && steps.length > 0 && (
-            <div className="flex items-start gap-3">
-              <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[#1E3A6B] to-[#0D7A8A] flex items-center justify-center flex-shrink-0">
-                <Wand2 size={13} className="text-white" />
-              </div>
-              <div className="flex-1">
-                <div className="text-[10px] font-semibold text-[#1E3A6B] mb-1.5">AI Works</div>
-                <div className="bg-white border border-gray-200 rounded-lg p-3 space-y-1">
-                  <p className="text-xs text-gray-700 mb-3 leading-relaxed">
-                    {assistantIntro}
-                  </p>
-
-                  {/* Action timeline */}
-                  <div className="border-t border-gray-100 pt-2.5 space-y-1.5">
-                    <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-2">Action Record</div>
-                    {steps.map((s, i) => (
-                      <div key={i} className={`flex items-center gap-2.5 px-2 py-1.5 rounded transition-all ${s.status === "write-done" ? "bg-orange-50 border border-orange-200" : s.status === "done" ? "bg-gray-50" : s.status === "running" ? "bg-blue-50/60" : "opacity-40"}`}>
-                        <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase flex-shrink-0 ${STEP_CLS[s.type]}`}>{s.type}</span>
-                        <span className={`text-xs flex-1 ${s.type === "write" ? "text-orange-800 font-medium" : "text-gray-700"}`}>{s.label}</span>
-                        <span className="flex-shrink-0 text-[10px] font-medium">
-                          {s.status === "running"    && <span className="text-blue-600 flex items-center gap-1"><RefreshCw size={9} className="animate-spin"/>Running</span>}
-                          {s.status === "done"       && <span className="text-green-600">Done</span>}
-                          {s.status === "write-done" && <span className="text-orange-600 font-semibold">Draft Created</span>}
-                          {s.status === "pending"    && <span className="text-gray-300">Pending</span>}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* Write action notice */}
-                  {draftReady && (
-                    <div className="mt-3 bg-orange-50 border border-orange-200 rounded p-2.5">
-                      <div className="flex items-center gap-1.5 mb-1">
-                        <Lock size={11} className="text-orange-600" />
-                        <span className="text-xs font-semibold text-orange-700">No production rules modified.</span>
-                      </div>
-                      <p className="text-xs text-orange-600 leading-relaxed">
-                        {assistantContext
-                          ? <>Assistant notes for <code className="font-mono">{assistantContext.ruleId}</code> are ready in this frontend prototype. Production is unchanged.</>
-                          : <>Draft <code className="font-mono">SUSTAIN-CHECK-003</code> created via Draft Function API. Production is unchanged. Maker review and checker approval required before release.</>}
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-
-          <div ref={bottomRef} />
-        </div>
-
-        {/* Input */}
-        <div className="border-t border-gray-200 p-4 flex-shrink-0">
-          <div className="flex items-start gap-2">
-            <textarea
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              placeholder={assistantContext ? `Ask about this ${contextLabel} or draft a controlled change…` : "Describe the rule function you need in plain language…"}
-              rows={2}
-              className="flex-1 text-xs border border-gray-200 rounded px-3 py-2 resize-none focus:outline-none focus:border-[#1E3A6B] placeholder-gray-400"
-            />
-            <button
-              onClick={() => runCreation(input || contextPrompt)}
-              disabled={phase === "running"}
-              className="flex items-center gap-1.5 px-4 py-2 bg-[#1E3A6B] text-white rounded text-xs font-semibold hover:bg-[#163059] disabled:opacity-50 self-end">
-              {phase === "running" ? <RefreshCw size={12} className="animate-spin" /> : <Wand2 size={12} />}
-              {phase === "running" ? "Creating…" : assistantContext ? "Ask" : "Generate"}
-            </button>
-          </div>
-          <p className="text-[10px] text-gray-400 mt-1.5 ml-1">{assistantContext ? `AI Works will prepare frontend-only guidance for the selected ${contextLabel}.` : "AI Works will create all rules, the I/O contract and test cases as a draft for your review."}</p>
         </div>
       </div>
 
-      {/* Right: draft preview */}
-      <div className="overflow-y-auto bg-[#F1F4F8] p-4" style={{ flex: "0 0 38%" }}>
-        <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
+      <div className="flex-1 overflow-y-auto p-4">
+        <div className="bg-white border border-gray-200 rounded overflow-hidden">
           <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
-            <span className="text-xs font-semibold text-gray-900">{assistantContext ? contextTitle : "Draft Preview"}</span>
-            {draftReady
-              ? <StatusBadge status="AI-Assisted Draft" size="xs" />
-              : <span className="text-[10px] text-gray-400">{phase === "running" ? "Building…" : "Awaiting generation"}</span>
-            }
+            <span className="text-xs font-semibold text-gray-900">Draft Rule Preview</span>
+            {generatedRule ? <StatusBadge status="AI-Assisted Draft" size="xs"/> : <span className="text-[10px] text-gray-400">Awaiting conversion</span>}
           </div>
-          <div className="p-4 space-y-4">
+          {generatedRule ? (
+            <div className="p-4 space-y-4">
+              <div className="grid grid-cols-4 gap-2 text-xs">
+                <div className="bg-gray-50 border border-gray-200 rounded p-2"><div className="text-gray-400 mb-0.5">Rule ID</div><code className="font-mono font-bold text-[#1E3A6B]">{generatedRule.id}</code></div>
+                <div className="bg-gray-50 border border-gray-200 rounded p-2"><div className="text-gray-400 mb-0.5">Type</div><RuleTypeBadge type={generatedRule.type}/></div>
+                <div className="bg-gray-50 border border-gray-200 rounded p-2"><div className="text-gray-400 mb-0.5">Inputs</div><div className="font-bold text-gray-900">{generatedRule.inputs.length}</div></div>
+                <div className="bg-gray-50 border border-gray-200 rounded p-2"><div className="text-gray-400 mb-0.5">Outputs</div><div className="font-bold text-gray-900">{generatedRule.outputs.length}</div></div>
+              </div>
 
-            {assistantContext && (
-              <div className="bg-blue-50 border border-blue-200 rounded p-3">
-                <div className="text-[10px] font-semibold text-blue-600 uppercase tracking-wide mb-2">{selectedLabel}</div>
-                <div className="space-y-1.5 text-xs">
-                  <div className="flex justify-between gap-3"><span className="text-gray-500">Name</span><span className="font-semibold text-gray-900 text-right">{assistantContext.ruleName}</span></div>
-                  <div className="flex justify-between gap-3"><span className="text-gray-500">{assistantContext.source === "function" ? "Function Key" : "Rule ID"}</span><code className="font-mono text-[#1E3A6B]">{assistantContext.ruleId}</code></div>
-                  <div className="flex justify-between gap-3"><span className="text-gray-500">Type</span><span className="font-medium text-gray-900">{assistantContext.ruleType}</span></div>
+              <div>
+                <div className="text-sm font-semibold text-gray-900">{generatedRule.name}</div>
+                <p className="text-xs text-gray-500 mt-1 leading-relaxed">{generatedRule.desc}</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="border border-gray-200 rounded overflow-hidden">
+                  <div className="px-3 py-2 bg-blue-50/50 border-b border-gray-200 text-xs font-semibold text-gray-700">Input Contract</div>
+                  {generatedRule.inputs.map(field=>(
+                    <div key={field.name} className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 last:border-0 text-xs">
+                      <code className="font-mono text-gray-900 flex-1">{field.name}</code>
+                      <TypeChip type={field.type}/>
+                    </div>
+                  ))}
                 </div>
-                <div className="mt-3 pt-3 border-t border-blue-200 text-xs text-blue-900 leading-relaxed">
-                  {draftReady ? "Assistant recommendations are ready for maker review in this prototype." : `Run the assistant to explain the ${contextLabel} setup and prepare draft-edit guidance.`}
+                <div className="border border-gray-200 rounded overflow-hidden">
+                  <div className="px-3 py-2 bg-green-50/50 border-b border-gray-200 text-xs font-semibold text-gray-700">Output Contract</div>
+                  {generatedRule.outputs.map(field=>(
+                    <div key={field.name} className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 last:border-0 text-xs">
+                      <code className="font-mono text-gray-900 flex-1">{field.name}</code>
+                      <TypeChip type={field.type}/>
+                    </div>
+                  ))}
                 </div>
               </div>
-            )}
 
-            {assistantContext ? (
-              <>
-                <div className={`space-y-2 transition-opacity ${draftReady ? "opacity-100" : "opacity-40"}`}>
-                  <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide">Assistant Focus</div>
-                  {assistantFocus.map(item => (
-                    <div key={item} className="flex items-center gap-2 bg-white border border-gray-200 rounded px-3 py-2 text-xs">
-                      <CheckCircle2 size={12} className={draftReady ? "text-green-600" : "text-gray-300"}/>
-                      <span className={draftReady ? "text-gray-800" : "text-gray-500"}>{item}</span>
-                    </div>
-                  ))}
-                </div>
-                <div className={`space-y-2 border-t border-gray-100 pt-3 transition-opacity ${draftReady ? "opacity-100" : "opacity-50"}`}>
-                  <button onClick={() => go("studio")}
-                    className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-[#1E3A6B] text-white rounded text-xs font-semibold hover:bg-[#163059]">
-                    <Layers size={12} />Return to Decision Studio
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                {/* Function metadata */}
-                <div className={`space-y-2 transition-opacity ${draftReady ? "opacity-100" : "opacity-30"}`}>
-                  <div className="grid grid-cols-2 gap-2 text-xs">
-                    <div><div className="text-gray-400 mb-0.5">Function Name</div><div className="font-semibold text-gray-900">Sustainability Suitability Check</div></div>
-                    <div><div className="text-gray-400 mb-0.5">Function Key</div><code className="font-mono text-sm font-bold text-gray-800">SUSTAIN-CHECK-003</code></div>
-                    <div><div className="text-gray-400 mb-0.5">Domain</div><div className="text-gray-700">Sustainable Wealth Advisory</div></div>
-                    <div><div className="text-gray-400 mb-0.5">Owner</div><div className="text-gray-700">Advisory Solutions</div></div>
-                  </div>
-                </div>
+              <div className="border border-gray-200 rounded overflow-hidden">
+                <div className="px-3 py-2 bg-slate-900 text-slate-100 text-xs font-semibold flex items-center gap-2"><Code2 size={12}/>AI Structured JSON</div>
+                <pre className="max-h-[360px] overflow-auto bg-slate-950 text-slate-100 p-3 text-[11px] leading-relaxed font-mono">{structuredJson}</pre>
+              </div>
 
-                {/* Rule families created */}
-                <div className={`transition-opacity ${steps.length > 2 ? "opacity-100" : "opacity-20"}`}>
-                  <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-2">Rule Families Created</div>
-                  <div className="space-y-1.5">
-                    {[
-                      { name:"ESG Score Evaluation",           type:"ScoringMatrix",   done: steps.find(s=>s.label.includes("ESG"))?.status === "done" || draftReady },
-                      { name:"Green Investment Allocation",     type:"ThresholdMatrix", done: steps.find(s=>s.label.includes("Green"))?.status === "done" || draftReady },
-                      { name:"Controversial Sector Screening",  type:"ExclusionList",  done: steps.find(s=>s.label.includes("Controversial"))?.status === "done" || draftReady },
-                    ].map(r => (
-                      <div key={r.name} className={`flex items-center gap-2.5 p-2 rounded border transition-all ${r.done ? "bg-white border-gray-200" : "bg-gray-50 border-gray-100 opacity-40"}`}>
-                        <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${r.done ? "bg-green-500" : "bg-gray-300"}`} />
-                        <span className="text-xs font-medium text-gray-800 flex-1">{r.name}</span>
-                        <span className={`text-[9px] px-1.5 py-0.5 rounded border font-medium ${ruleTypeCls[r.type]}`}>{r.type}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Stats */}
-                <div className={`grid grid-cols-3 gap-2 transition-opacity ${draftReady ? "opacity-100" : "opacity-20"}`}>
-                  {[
-                    { label:"Rules Created",      value:"3",   color:"text-[#1E3A6B]" },
-                    { label:"Validation Errors",  value:"0",   color:"text-green-700" },
-                    { label:"Test Cases",         value:"6",   color:"text-blue-700"  },
-                  ].map(m => (
-                    <div key={m.label} className="bg-gray-50 border border-gray-200 rounded p-2.5 text-center">
-                      <div className={`text-xl font-bold ${m.color}`}>{m.value}</div>
-                      <div className="text-[9px] text-gray-400 mt-0.5 leading-tight">{m.label}</div>
-                    </div>
-                  ))}
-                </div>
-
-                {/* I/O contract summary */}
-                <div className={`transition-opacity ${draftReady ? "opacity-100" : "opacity-20"}`}>
-                  <div className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1.5">Auto-generated I/O Contract</div>
-                  <div className="space-y-1">
-                    {[
-                      { dir:"IN",  field:"esgScore",              type:"number" },
-                      { dir:"IN",  field:"greenAllocationPct",    type:"number" },
-                      { dir:"IN",  field:"controversialFlags",    type:"array"  },
-                      { dir:"IN",  field:"cip",                   type:"enum"   },
-                      { dir:"OUT", field:"sustainabilityRating",  type:"number" },
-                      { dir:"OUT", field:"sustainabilityEligible",type:"boolean"},
-                      { dir:"OUT", field:"reasonCodes",           type:"array"  },
-                    ].map(f => (
-                      <div key={f.field} className="flex items-center gap-2 text-xs">
-                        <span className={`text-[9px] font-bold w-6 flex-shrink-0 ${f.dir === "IN" ? "text-blue-600" : "text-green-600"}`}>{f.dir}</span>
-                        <code className="font-mono text-gray-800 flex-1">{f.field}</code>
-                        <TypeChip type={f.type} />
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Actions */}
-                <div className={`space-y-2 border-t border-gray-100 pt-3 transition-opacity ${draftReady ? "opacity-100" : "opacity-30 pointer-events-none"}`}>
-                  <button onClick={() => go("studio")}
-                    className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-[#1E3A6B] text-white rounded text-xs font-semibold hover:bg-[#163059]">
-                    <Layers size={12} />Open in Decision Studio
-                  </button>
-                  <button className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-gray-200 text-gray-700 rounded text-xs hover:bg-gray-50">
-                    <GitBranch size={12} />View Decision Tree
-                  </button>
-                  <button onClick={() => { setPhase("idle"); setSteps([]); setDraftReady(false); }}
-                    className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white border border-red-200 text-red-600 rounded text-xs hover:bg-red-50">
-                    <X size={12} />Discard Draft
-                  </button>
-                </div>
-
-                {!draftReady && phase === "idle" && (
-                  <div className="py-6 text-center">
-                    <Wand2 size={28} className="mx-auto mb-2 text-gray-300" />
-                    <div className="text-xs text-gray-400">Describe your rule function on the left to get started.</div>
-                  </div>
-                )}
-              </>
-            )}
-          </div>
+              <div className="flex items-center gap-2 border-t border-gray-100 pt-3">
+                <button onClick={addToLibrary} disabled={!canAdd}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059] disabled:opacity-40">
+                  <Plus size={12}/>{createdRuleId ? "Added to Rule Library" : "Add to Rule Library"}
+                </button>
+                <button onClick={()=>go("studio")} disabled={!createdRuleId}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-gray-200 text-gray-700 rounded text-xs font-medium hover:bg-gray-50 disabled:opacity-40">
+                  <Layers size={12}/>Open in Decision Studio
+                </button>
+                <button onClick={()=>{ setGeneratedRule(null); setCreatedRuleId(null); setPhase("idle"); setSteps([]); }}
+                  className="ml-auto flex items-center gap-1.5 px-3 py-1.5 bg-white border border-red-200 text-red-600 rounded text-xs font-medium hover:bg-red-50">
+                  <X size={12}/>Discard
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="p-10 text-center text-xs text-gray-400">
+              <Wand2 size={32} className="mx-auto mb-3 text-gray-300"/>
+              Enter rule logic on the left and convert it into structured JSON.
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -3348,25 +3275,83 @@ function AIWorksScreen({ go, assistantContext }: { go: (s: Screen) => void; assi
 
 // ─── Decision Studio ──────────────────────────────────────────────────────────
 
+const CREATE_FUNCTION_SAMPLE =
+  "Create a Sustainability Suitability Check function for wealth advisory. It should evaluate ESG score, green investment allocation percentage, controversial sector exposure and CIP alignment before producing a maker-reviewable suitability outcome.";
+
+function buildFunctionKey(name: string, sequence: number) {
+  const words = name
+    .replace(/[^a-zA-Z0-9 ]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  const prefix = words.length >= 2
+    ? words.slice(0, 3).map(w=>w[0]).join("")
+    : (words[0] ?? "FN").slice(0, 3);
+  return `${prefix.toUpperCase()}-${String(sequence).padStart(3, "0")}`;
+}
+
+function buildCreatedFunctionTestCases(fn: RuleFunctionDef, allRules: Rule[]): TestCase[] {
+  const fnRules = fn.ruleIds.map(id=>allRules.find(r=>r.id===id)).filter(Boolean) as Rule[];
+  const inputSamples = Array.from(new Map(fnRules.flatMap(rule=>rule.inputs).map(field=>[field.name, field.sample === "null" ? "" : field.sample])).entries())
+    .reduce<Record<string,string>>((acc, [name, sample]) => ({ ...acc, [name]: sample }), {});
+  const outputSamples = fnRules.slice(-1).flatMap(rule=>rule.outputs).reduce<Record<string,string>>((acc, field)=>({ ...acc, [field.name]: field.sample }), {});
+  const today = new Date().toLocaleDateString("en-GB", { day:"2-digit", month:"short", year:"numeric" });
+
+  return [
+    {
+      id: `TC-${fn.key}-001`,
+      name: `${fn.name} - baseline regression`,
+      fnKey: fn.key,
+      inputs: inputSamples,
+      expectedOutput: outputSamples,
+      status: "not-run",
+      createdAt: today,
+    },
+    {
+      id: `TC-${fn.key}-002`,
+      name: `${fn.name} - boundary review case`,
+      fnKey: fn.key,
+      inputs: inputSamples,
+      expectedOutput: outputSamples,
+      status: "not-run",
+      createdAt: today,
+    },
+  ];
+}
+
 function DecisionStudio({
   fnKey, setFnKey, go, onAskRuleAssistant, onAskFunctionAssistant,
+  localRules, setLocalRules, ruleDrafts, setRuleDrafts, initialRuleId, onInitialRuleConsumed,
 }: {
   fnKey:string;
   setFnKey:(k:string)=>void;
   go:(s:Screen)=>void;
   onAskRuleAssistant:(rule: Rule)=>void;
   onAskFunctionAssistant:(fn: RuleFunctionDef)=>void;
+  localRules: Rule[];
+  setLocalRules: React.Dispatch<React.SetStateAction<Rule[]>>;
+  ruleDrafts: Record<string,string>;
+  setRuleDrafts: React.Dispatch<React.SetStateAction<Record<string,string>>>;
+  initialRuleId: string|null;
+  onInitialRuleConsumed:()=>void;
 }) {
-  const [view,      setView]      = useState<StudioView>("function");
-  const [selRuleId, setSelRuleId] = useState<string|null>(null);
+  const [view,      setView]      = useState<StudioView>(initialRuleId ? "rule" : "function");
+  const [selRuleId, setSelRuleId] = useState<string|null>(initialRuleId);
   const [studioNavTab, setStudioNavTab] = useState<"functions"|"rules">("functions");
   const [ruleSearch,setRuleSearch]= useState("");
   const [testCases, setTestCases] = useState<TestCase[]>(INITIAL_TEST_CASES);
-  const [ruleDrafts, setRuleDrafts] = useState<Record<string,string>>({});
-  const [localRules, setLocalRules] = useState<Rule[]>(RULES);
   const [showNewRule, setShowNewRule] = useState(false);
   const [newRuleLogic, setNewRuleLogic] = useState("");
   const [generatedRule, setGeneratedRule] = useState<Rule|null>(null);
+  const [showCreateFunction, setShowCreateFunction] = useState(false);
+  const [newFunctionForm, setNewFunctionForm] = useState({
+    name: "Sustainability Suitability Check",
+    domain: "Sustainable Wealth Advisory",
+    tier: "Tier 1",
+    owner: "Advisory Solutions",
+    desc: CREATE_FUNCTION_SAMPLE,
+    flowType: "sequential" as "sequential"|"weighted",
+    selectedRuleIds: ["R-ESG-001","R-THEME-001","R-CIP-001"],
+  });
   // Local copies of functions (so we can mutate rule lists)
   const [localFns,  setLocalFns]  = useState<RuleFunctionDef[]>(RULE_FUNCTIONS);
 
@@ -3407,9 +3392,81 @@ function DecisionStudio({
     setStudioNavTab("rules");
     setShowNewRule(false);
   };
+  const openCreateFunction = () => {
+    setShowCreateFunction(true);
+    setStudioNavTab("functions");
+  };
+  const toggleCreateFunctionRule = (ruleId:string) => {
+    setNewFunctionForm(form=>({
+      ...form,
+      selectedRuleIds: form.selectedRuleIds.includes(ruleId)
+        ? form.selectedRuleIds.filter(id=>id!==ruleId)
+        : [...form.selectedRuleIds, ruleId],
+    }));
+  };
+  const createRuleFunction = () => {
+    const selectedRuleIds = newFunctionForm.selectedRuleIds.filter(ruleId=>localRules.some(rule=>rule.id===ruleId));
+    if (!newFunctionForm.name.trim() || selectedRuleIds.length === 0) return;
+    const key = buildFunctionKey(newFunctionForm.name, localFns.filter(fn=>fn.key.includes("-")).length + 1);
+    const activeRelease = "v0.1";
+    const hasAggregation = selectedRuleIds.some(ruleId=>localRules.find(rule=>rule.id===ruleId)?.type==="WeightedAggregation");
+    const ruleIds = newFunctionForm.flowType === "weighted" && !hasAggregation
+      ? [...selectedRuleIds, "R-OVERALL-001"]
+      : selectedRuleIds;
+    const weightedRuleIds = ruleIds.filter(ruleId=>{
+      const rule = localRules.find(r=>r.id===ruleId);
+      return rule && rule.type !== "WeightedAggregation" && rule.type !== "ExclusionList";
+    });
+    const evenWeight = weightedRuleIds.length ? Math.round((100 / weightedRuleIds.length) * 100) / 100 : 0;
+    const weights = newFunctionForm.flowType === "weighted"
+      ? weightedRuleIds.reduce<Record<string, number>>((acc, ruleId, index)=>{
+          acc[ruleId] = index === weightedRuleIds.length - 1
+            ? Math.round((100 - evenWeight * (weightedRuleIds.length - 1)) * 100) / 100
+            : evenWeight;
+          return acc;
+        }, {})
+      : undefined;
+    const createdFn: RuleFunctionDef = {
+      key,
+      name: newFunctionForm.name.trim(),
+      desc: newFunctionForm.desc.trim() || "Maker-created rule function draft.",
+      domain: newFunctionForm.domain.trim() || "Advisory Decisions",
+      tier: newFunctionForm.tier,
+      owner: newFunctionForm.owner.trim() || "Advisory Solutions",
+      activeRelease,
+      draftRelease: `${activeRelease}-draft`,
+      status: "Draft - Maker Review Required",
+      ruleIds,
+      weights,
+      conditionSteps: [{
+        id: `COND-${key}-MAKER-REVIEW`,
+        name: "Maker Review Gate",
+        condition: "latestValidatedJson = true AND simulationEvidenceAvailable = true",
+        trueFlowId: "SUBMIT_FOR_CHECKER_REVIEW",
+        trueLabel: "Eligible for maker submission",
+        falseFlowId: "DRAFT_EDITING_FLOW",
+        falseLabel: "Keep draft in maker editing",
+        note: "Created with the local Draft Function workflow. Checker approval and release are still required.",
+      }],
+    };
+    setLocalFns(prev=>[createdFn, ...prev]);
+    setTestCases(prev=>[...prev, ...buildCreatedFunctionTestCases(createdFn, localRules)]);
+    setFnKey(createdFn.key);
+    setView("function");
+    setStudioNavTab("functions");
+    setShowCreateFunction(false);
+  };
 
   const openFn = (key:string) => { setFnKey(key); setView("function"); setStudioNavTab("functions"); };
   const openRule = (id:string) => { setSelRuleId(id); setView("rule"); setStudioNavTab("rules"); };
+
+  useEffect(() => {
+    if (!initialRuleId) return;
+    setSelRuleId(initialRuleId);
+    setView("rule");
+    setStudioNavTab("rules");
+    onInitialRuleConsumed();
+  }, [initialRuleId]);
 
   const handleSaveTestCase = (tc:TestCase) => setTestCases(p=>[...p, tc]);
   const handleDeleteTestCase = (id:string) => setTestCases(p=>p.filter(tc=>tc.id!==id));
@@ -3505,7 +3562,7 @@ function DecisionStudio({
             <div>
               <div className="flex items-center gap-2 px-4 py-2">
                 <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wide flex-1">Rule Functions</span>
-                <button onClick={openNewRule} className="text-gray-300 hover:text-[#1E3A6B]" title="Add New Rule"><Plus size={11}/></button>
+                <button onClick={openCreateFunction} className="text-gray-300 hover:text-[#1E3A6B]" title="Create Rule Function"><Plus size={11}/></button>
               </div>
               {filteredFns.map(fn=>(
                 <button key={fn.key} onClick={()=>openFn(fn.key)}
@@ -3522,7 +3579,7 @@ function DecisionStudio({
                 </button>
               ))}
               {filteredFns.length===0 && <div className="px-4 py-8 text-center text-xs text-gray-400">No rule functions found</div>}
-              <button onClick={()=>{}} className="w-full flex items-center gap-2 px-4 py-2 text-[11px] text-[#1E3A6B] hover:bg-blue-50 transition-colors">
+              <button onClick={openCreateFunction} className="w-full flex items-center gap-2 px-4 py-2 text-[11px] text-[#1E3A6B] hover:bg-blue-50 transition-colors">
                 <Plus size={11}/><span className="font-medium">Create Rule Function</span>
               </button>
             </div>
@@ -3575,6 +3632,145 @@ function DecisionStudio({
             testCases={testCases} onSaveTestCase={handleSaveTestCase} onDeleteTestCase={handleDeleteTestCase} go={go} onAskAssistant={onAskFunctionAssistant}/>
         )}
       </div>
+      {showCreateFunction&&(
+        <div className="fixed inset-0 z-50 flex items-center justify-center" style={{backgroundColor:"rgba(13,27,62,0.5)"}}>
+          <div className="bg-white rounded-lg shadow-2xl w-[820px] max-h-[86vh] flex flex-col">
+            <div className="px-5 py-4 border-b border-gray-200 flex items-center justify-between">
+              <div>
+                <div className="text-sm font-semibold text-gray-900">Create Rule Function</div>
+                <div className="text-xs text-gray-500 mt-0.5">Create a maker-owned draft function from selected library rules.</div>
+              </div>
+              <button onClick={()=>setShowCreateFunction(false)} className="text-gray-400 hover:text-gray-600"><X size={16}/></button>
+            </div>
+            <div className="flex-1 overflow-auto p-5 space-y-4">
+              <GovernanceBanner text="Draft functions are created in Decision Studio only. Production remains unchanged until maker submission, checker approval and release activation."/>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-3">
+                  <div>
+                    <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Function Name</label>
+                    <input
+                      value={newFunctionForm.name}
+                      onChange={e=>setNewFunctionForm({...newFunctionForm, name:e.target.value})}
+                      className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Business Purpose</label>
+                    <textarea
+                      value={newFunctionForm.desc}
+                      onChange={e=>setNewFunctionForm({...newFunctionForm, desc:e.target.value})}
+                      rows={5}
+                      className="w-full border border-gray-200 rounded px-3 py-2 text-xs leading-relaxed resize-none outline-none focus:border-[#1E3A6B]"
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Domain</label>
+                      <input
+                        value={newFunctionForm.domain}
+                        onChange={e=>setNewFunctionForm({...newFunctionForm, domain:e.target.value})}
+                        className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Owner</label>
+                      <input
+                        value={newFunctionForm.owner}
+                        onChange={e=>setNewFunctionForm({...newFunctionForm, owner:e.target.value})}
+                        className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B]"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Tier</label>
+                      <select
+                        value={newFunctionForm.tier}
+                        onChange={e=>setNewFunctionForm({...newFunctionForm, tier:e.target.value})}
+                        className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B] bg-white"
+                      >
+                        <option>Tier 1</option>
+                        <option>Tier 2</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Execution Pattern</label>
+                      <select
+                        value={newFunctionForm.flowType}
+                        onChange={e=>setNewFunctionForm({...newFunctionForm, flowType:e.target.value as "sequential"|"weighted"})}
+                        className="w-full border border-gray-200 rounded px-3 py-2 text-xs outline-none focus:border-[#1E3A6B] bg-white"
+                      >
+                        <option value="sequential">Sequential rule flow</option>
+                        <option value="weighted">Parallel weighted flow</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="border border-gray-200 rounded overflow-hidden flex flex-col min-h-[420px]">
+                  <div className="px-3 py-2 bg-gray-50 border-b border-gray-200">
+                    <div className="text-xs font-semibold text-gray-800">Rule Membership</div>
+                    <div className="text-[10px] text-gray-500 mt-0.5">{newFunctionForm.selectedRuleIds.length} selected. I/O contract is derived after creation.</div>
+                  </div>
+                  <div className="flex-1 overflow-auto divide-y divide-gray-100">
+                    {localRules.map(rule=> {
+                      const checked = newFunctionForm.selectedRuleIds.includes(rule.id);
+                      return (
+                        <label key={rule.id} className={`flex items-start gap-3 px-3 py-2.5 cursor-pointer hover:bg-gray-50 ${checked?"bg-blue-50/50":""}`}>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={()=>toggleCreateFunctionRule(rule.id)}
+                            className="mt-0.5"
+                          />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs font-medium text-gray-900">{rule.name}</span>
+                              <RuleTypeBadge type={rule.type}/>
+                            </div>
+                            <div className="text-[10px] text-gray-500 mt-0.5 line-clamp-2">{rule.desc}</div>
+                            <div className="text-[9px] text-gray-400 mt-1 font-mono">{rule.id} · inputs {rule.inputs.length} · outputs {rule.outputs.length}</div>
+                          </div>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-3">
+                {[
+                  { label:"Draft State", value:"DRAFT_EDITING", icon:PenLine },
+                  { label:"Evidence Seed", value:"2 test cases", icon:TestTube },
+                  { label:"Release Guardrail", value:"Checker required", icon:Shield },
+                ].map(item=>{
+                  const Icon = item.icon;
+                  return (
+                    <div key={item.label} className="bg-gray-50 border border-gray-200 rounded p-3">
+                      <div className="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wide font-semibold"><Icon size={11}/>{item.label}</div>
+                      <div className="text-xs font-semibold text-gray-900 mt-1">{item.value}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="px-5 py-3 border-t border-gray-200 flex items-center justify-between gap-2">
+              <div className="text-[10px] text-gray-400">Creates local frontend draft data only, matching the current prototype architecture.</div>
+              <div className="flex items-center gap-2">
+                <button onClick={()=>setShowCreateFunction(false)} className="px-3 py-1.5 border border-gray-200 rounded text-xs font-medium text-gray-600 hover:bg-gray-50">Cancel</button>
+                <button
+                  onClick={createRuleFunction}
+                  disabled={!newFunctionForm.name.trim() || newFunctionForm.selectedRuleIds.length===0}
+                  className="px-3 py-1.5 bg-[#1E3A6B] text-white rounded text-xs font-medium hover:bg-[#163059] disabled:opacity-40 flex items-center gap-1.5"
+                >
+                  <Plus size={12}/>Create Draft Function
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       {showNewRule&&(
         <div className="fixed inset-0 z-50 flex items-center justify-center" style={{backgroundColor:"rgba(13,27,62,0.5)"}}>
           <div className="bg-white rounded-lg shadow-2xl w-[760px] max-h-[84vh] flex flex-col">
@@ -4121,7 +4317,7 @@ function MyDrafts({ go, setStudioFn }:{ go:(s:Screen)=>void; setStudioFn:(k:stri
     <div className="flex flex-col h-full bg-[#F1F4F8]">
       <div className="bg-white border-b border-gray-200 px-6 py-4 flex items-start justify-between">
         <div><h1 className="text-lg font-semibold text-gray-900">My Drafts</h1><p className="text-xs text-gray-500 mt-0.5">{drafts.length} drafts requiring your review.</p></div>
-        <Btn icon={Sparkles} label="Create with AI" primary onClick={()=>go("studio")}/>
+        <Btn icon={Sparkles} label="Create Rule" primary onClick={()=>go("ai-works")}/>
       </div>
       <div className="flex-1 overflow-auto p-4">
         <div className="bg-white border border-gray-200 rounded overflow-hidden">
@@ -4181,6 +4377,9 @@ export default function App() {
   const [screen,   setScreen]   = useState<Screen>("studio");
   const [studioFn, setStudioFn] = useState("PS");
   const [assistantContext, setAssistantContext] = useState<AssistantContext|null>(null);
+  const [localRules, setLocalRules] = useState<Rule[]>(RULES);
+  const [ruleDrafts, setRuleDrafts] = useState<Record<string,string>>({});
+  const [initialStudioRuleId, setInitialStudioRuleId] = useState<string|null>(null);
 
   const go = (s:Screen) => {
     if (s !== "ai-works") setAssistantContext(null);
@@ -4218,17 +4417,24 @@ export default function App() {
     setScreen("ai-works");
   };
 
+  const createRuleDraft = (rule: Rule, sourceText: string) => {
+    setLocalRules(prev => prev.some(r=>r.id===rule.id) ? prev : [rule, ...prev]);
+    setRuleDrafts(prev => ({...prev, [rule.id]: sourceText.trim()}));
+    setInitialStudioRuleId(rule.id);
+    return rule;
+  };
+
   const render = () => {
     switch (screen) {
-      case "studio":       return <DecisionStudio   fnKey={studioFn} setFnKey={setStudioFn} go={go} onAskRuleAssistant={askRuleAssistant} onAskFunctionAssistant={askFunctionAssistant}/>;
-      case "ai-works":     return <AIWorksScreen    go={go} assistantContext={assistantContext}/>;
+      case "studio":       return <DecisionStudio   fnKey={studioFn} setFnKey={setStudioFn} go={go} onAskRuleAssistant={askRuleAssistant} onAskFunctionAssistant={askFunctionAssistant} localRules={localRules} setLocalRules={setLocalRules} ruleDrafts={ruleDrafts} setRuleDrafts={setRuleDrafts} initialRuleId={initialStudioRuleId} onInitialRuleConsumed={()=>setInitialStudioRuleId(null)}/>;
+      case "ai-works":     return <AIWorksScreen    go={go} assistantContext={assistantContext} localRules={localRules} onCreateRule={createRuleDraft}/>;
       case "drafts":       return <MyDrafts         go={go} setStudioFn={setStudioFn}/>;
       case "review-queue": return <CheckerReview    go={go}/>;
       case "release":      return <ReleaseCenter    go={go}/>;
       case "trace":        return <DecisionTrace/>;
       case "settings":     return <PlatformSettings/>;
       case "maker-submit": return <MakerSubmit      go={go}/>;
-      default:             return <DecisionStudio   fnKey={studioFn} setFnKey={setStudioFn} go={go} onAskRuleAssistant={askRuleAssistant} onAskFunctionAssistant={askFunctionAssistant}/>;
+      default:             return <DecisionStudio   fnKey={studioFn} setFnKey={setStudioFn} go={go} onAskRuleAssistant={askRuleAssistant} onAskFunctionAssistant={askFunctionAssistant} localRules={localRules} setLocalRules={setLocalRules} ruleDrafts={ruleDrafts} setRuleDrafts={setRuleDrafts} initialRuleId={initialStudioRuleId} onInitialRuleConsumed={()=>setInitialStudioRuleId(null)}/>;
     }
   };
 

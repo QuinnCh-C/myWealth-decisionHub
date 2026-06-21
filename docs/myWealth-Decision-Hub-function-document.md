@@ -35,7 +35,7 @@ The left navigation exposes these modules:
 | Module | Function |
 | --- | --- |
 | Decision Studio | Main authoring workspace for rules and rule functions. |
-| AI Works | AI-assisted draft generation workspace. |
+| Create Rule | AI-assisted single-rule creation and structured JSON conversion workspace. |
 | My Drafts | Draft work queue placeholder. |
 | Review Queue | Checker review workbench. |
 | Release Center | Per-environment maker-checker release control with immediate or effective-date activation. |
@@ -243,19 +243,20 @@ Backend execution model shown in the UI:
 - Decision-tree nodes use condition results to choose `onTrue` or `onFalse` transitions, including named `flowId` routing, next-node routing, warning flow, exception flow, or terminal outcome.
 - Java backend execution uses the structured JSON only; the visual flow and decision tree are review surfaces for the same executable artifact.
 
-### 7.2 AI Works
+### 7.2 Create Rule
 
 Functions:
 
-- Lets a maker describe a rule function in plain language.
-- Simulates AI-assisted draft creation through a step timeline.
-- Creates a sample Sustainability Suitability Check draft preview.
-- Shows generated rule families, I/O contract, validation count, and test case count.
-- Emphasizes that AI creates maker-owned drafts only.
+- Lets a maker enter rule logic text in plain language or policy-style prose.
+- Simulates AI-assisted conversion through a step timeline.
+- Infers rule type, inputs, outputs, reason-code pattern, and draft rule metadata.
+- Converts the maker-entered rule logic into AI Structured JSON.
+- Allows the generated draft rule to be added to the local Rule Library and opened in Decision Studio.
+- Emphasizes that AI creates maker-owned draft rules only.
 
 Governance constraints shown in the UI:
 
-- AI Works cannot approve, activate, or deploy.
+- Create Rule cannot approve, activate, or deploy.
 - Production rules remain unchanged.
 - Drafts require maker review and checker approval.
 
@@ -386,7 +387,7 @@ The prototype repeatedly enforces these principles in screen copy and workflow s
 - Add, remove, move rule operations are local to React state.
 - Test case creation is local to React state.
 - Search and filters are mostly visual; some rule search is functional.
-- AI Works timeline is simulated with timers and static draft content.
+- Create Rule conversion is simulated with timers and frontend-only generated JSON.
 - Review, approval, release, and deployment actions are screen transitions only.
 - My Drafts remains a placeholder.
 - Platform Settings now shows the expected configuration areas, but configuration actions remain prototype-only.
